@@ -10,6 +10,7 @@ import dr.evolution.tree.NodeRef;
 import dr.evolution.tree.Tree;
 import dr.evomodel.branchratemodel.BranchRateModel;
 import dr.inference.model.*;
+import dr.xml.Reportable;
 
 import java.util.Arrays;
 import java.util.List;
@@ -23,7 +24,7 @@ import java.util.List;
  *
  * @author Samir Bhatt
  */
-public class TorusFourierTreeLikelihood extends AbstractModelLikelihood {
+public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implements Reportable {
 
     public static final String TORUS_FOURIER_LIKELIHOOD = "torusFourierTreeLikelihood";
     private static final double MIN_BRANCH = 1.0e-8;   // floor for zero-length branches (replicate tips)
@@ -80,6 +81,10 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood {
     }
 
     public void makeDirty() { likelihoodKnown = false; }
+
+    public String getReport() {
+        return getClass().getSimpleName() + ": logL = " + getLogLikelihood();
+    }
 
     private double calculateLogLikelihood() {
         final NodeRef root = tree.getRoot();
