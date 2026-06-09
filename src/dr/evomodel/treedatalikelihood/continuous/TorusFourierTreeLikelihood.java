@@ -29,6 +29,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
 
     public static final String TORUS_FOURIER_LIKELIHOOD = "torusFourierTreeLikelihood";
     private static final double MIN_BRANCH = 1.0e-8;   // floor for zero-length branches (replicate tips)
+    private static final int PARALLEL_THRESHOLD = 8;   // parallelise the residue loop at/above this many residues
 
     private final Tree tree;
     private final BranchRateModel branchRateModel;     // nullable -> rate 1
@@ -92,14 +93,19 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
 
     private double calculateLogLikelihood() {
         final NodeRef root = tree.getRoot();
-        double total = 0.0;
-        for (int r = 0; r < nResidues; r++) {
-            final double[][] sigma = invertPrecision(precisions.get(r));
-            final double[] logScale = new double[1];
-            final double[] rootValues = nodeValues(r, root, sigma, logScale);
-            total += logScale[0] + Math.log(kernel.rootIntegral(rootValues));
-        }
-        return total;
+        // Residues are independent; the kernel and all per-residue state are read-only
+        // during evaluation, so the residue loop parallelises safely. Above a threshold
+        // we use a parallel stream (helps many-residue datasets such as the p=2 sweeps).
+        java.util.stream.IntStream stream = java.util.stream.IntStream.range(0, nResidues);
+        if (nResidues >= PARALLEL_THRESHOLD) stream = stream.parallel();
+        return stream.mapToDouble(r -> residueLogLikelihood(r, root)).sum();
+    }
+
+    private double residueLogLikelihood(int r, NodeRef root) {
+        final double[][] sigma = invertPrecision(precisions.get(r));
+        final double[] logScale = new double[1];
+        final double[] rootValues = nodeValues(r, root, sigma, logScale);
+        return logScale[0] + Math.log(kernel.rootIntegral(rootValues));
     }
 
     /** Post-order product of child messages at an internal node (mirrors prune_loglik). */
