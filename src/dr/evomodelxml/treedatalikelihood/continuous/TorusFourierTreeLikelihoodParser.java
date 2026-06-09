@@ -20,9 +20,10 @@ import java.util.List;
 
 /**
  * Parses a {@link TorusFourierTreeLikelihood}: a spectral (FFT) Felsenstein pruning
- * likelihood for independent 2D wrapped-Brownian diffusions of backbone dihedrals.
- * Each &lt;residue&gt; block names a 2-dimensional tip trait (phi, psi) read from the
- * taxon attributes and supplies a 2x2 precision matrix for that residue.
+ * likelihood for independent d-dimensional wrapped-Brownian diffusions of backbone
+ * dihedrals. Each &lt;residue&gt; block names a d-dimensional tip trait (e.g. phi,
+ * psi) read from the taxon attributes and supplies a dim x dim precision matrix; the
+ * common dimension d is inferred from the precision matrices.
  *
  * @author Samir Bhatt
  */
@@ -42,31 +43,20 @@ public class TorusFourierTreeLikelihoodParser extends AbstractXMLObjectParser {
         final Tree tree = (Tree) xo.getChild(Tree.class);
         final BranchRateModel branchRateModel = (BranchRateModel) xo.getChild(BranchRateModel.class);
         final int nGrid = xo.getAttribute(N_GRID, 64);
-        final TorusFourierKernel kernel = new TorusFourierKernel(nGrid);
-        final int nExt = tree.getExternalNodeCount();
 
+        // collect residue specifications and infer the common dimension
+        final List<String> traitNames = new ArrayList<String>();
         final List<MatrixParameter> precisions = new ArrayList<MatrixParameter>();
-        final List<double[][]> tip = new ArrayList<double[][]>();
-
         for (int i = 0; i < xo.getChildCount(); i++) {
             if (xo.getChild(i) instanceof XMLObject) {
                 final XMLObject cxo = (XMLObject) xo.getChild(i);
                 if (cxo.getName().equals(RESIDUE)) {
-                    final String traitName = cxo.getStringAttribute(TRAIT_NAME);
                     final MatrixParameter precision = (MatrixParameter) cxo.getChild(MatrixParameter.class);
                     if (precision == null) {
-                        throw new XMLParseException("residue '" + traitName
-                                + "' requires a 2x2 matrixParameter precision");
+                        throw new XMLParseException("a <" + RESIDUE + "> requires a square precision matrixParameter");
                     }
-                    final double[][] data = new double[nExt][];
-                    for (int e = 0; e < nExt; e++) {
-                        final NodeRef ext = tree.getExternalNode(e);
-                        final Taxon taxon = tree.getNodeTaxon(ext);
-                        final Object attr = (taxon == null) ? null : taxon.getAttribute(traitName);
-                        data[ext.getNumber()] = parsePair(attr, traitName, taxon);
-                    }
+                    traitNames.add(cxo.getStringAttribute(TRAIT_NAME));
                     precisions.add(precision);
-                    tip.add(data);
                 }
             }
         }
@@ -74,31 +64,58 @@ public class TorusFourierTreeLikelihoodParser extends AbstractXMLObjectParser {
             throw new XMLParseException(TORUS_FOURIER_LIKELIHOOD + " requires at least one <" + RESIDUE + ">");
         }
 
-        final double[][][] tipData = tip.toArray(new double[0][][]);
+        final int dim = precisions.get(0).getRowDimension();
+        for (MatrixParameter p : precisions) {
+            if (p.getRowDimension() != dim || p.getColumnDimension() != dim) {
+                throw new XMLParseException("all <" + RESIDUE + "> precision matrices must be square of the same dimension ("
+                        + dim + ")");
+            }
+        }
+        final TorusFourierKernel kernel = new TorusFourierKernel(dim, nGrid);
+
+        // read the per-taxon d-vectors for each residue
+        final int nExt = tree.getExternalNodeCount();
+        final double[][][] tipData = new double[precisions.size()][][];
+        for (int r = 0; r < traitNames.size(); r++) {
+            final String traitName = traitNames.get(r);
+            final double[][] data = new double[nExt][];
+            for (int e = 0; e < nExt; e++) {
+                final NodeRef ext = tree.getExternalNode(e);
+                final Taxon taxon = tree.getNodeTaxon(ext);
+                final Object attr = (taxon == null) ? null : taxon.getAttribute(traitName);
+                data[ext.getNumber()] = parseVector(attr, dim, traitName, taxon);
+            }
+            tipData[r] = data;
+        }
+
         String id = xo.getId();
         if (id == null) id = TORUS_FOURIER_LIKELIHOOD;
         return new TorusFourierTreeLikelihood(id, tree, branchRateModel, precisions, tipData, kernel);
     }
 
-    /** Parse a taxon attribute holding two angles (radians), as Object[]/double[]/string. */
-    private double[] parsePair(Object attr, String traitName, Taxon taxon) throws XMLParseException {
+    /** Parse a taxon attribute holding dim angles (radians), as Object[]/double[]/string. */
+    private double[] parseVector(Object attr, int dim, String traitName, Taxon taxon) throws XMLParseException {
         final String who = (taxon == null) ? "?" : taxon.getId();
         if (attr == null) {
             throw new XMLParseException("taxon '" + who + "' lacks attribute '" + traitName + "'");
         }
+        final double[] v = new double[dim];
         if (attr instanceof Object[]) {
             final Object[] a = (Object[]) attr;
-            if (a.length != 2) throw new XMLParseException("attribute '" + traitName + "' needs 2 values for " + who);
-            return new double[]{((Number) a[0]).doubleValue(), ((Number) a[1]).doubleValue()};
+            if (a.length != dim) throw new XMLParseException("attribute '" + traitName + "' needs " + dim + " values for " + who);
+            for (int i = 0; i < dim; i++) v[i] = ((Number) a[i]).doubleValue();
+            return v;
         }
         if (attr instanceof double[]) {
             final double[] a = (double[]) attr;
-            if (a.length != 2) throw new XMLParseException("attribute '" + traitName + "' needs 2 values for " + who);
-            return new double[]{a[0], a[1]};
+            if (a.length != dim) throw new XMLParseException("attribute '" + traitName + "' needs " + dim + " values for " + who);
+            System.arraycopy(a, 0, v, 0, dim);
+            return v;
         }
         final String[] parts = attr.toString().trim().split("\\s+");
-        if (parts.length != 2) throw new XMLParseException("attribute '" + traitName + "' needs 2 values for " + who);
-        return new double[]{Double.parseDouble(parts[0]), Double.parseDouble(parts[1])};
+        if (parts.length != dim) throw new XMLParseException("attribute '" + traitName + "' needs " + dim + " values for " + who);
+        for (int i = 0; i < dim; i++) v[i] = Double.parseDouble(parts[i]);
+        return v;
     }
 
     public XMLSyntaxRule[] getSyntaxRules() {
@@ -114,7 +131,7 @@ public class TorusFourierTreeLikelihoodParser extends AbstractXMLObjectParser {
     }
 
     public String getParserDescription() {
-        return "Spectral (FFT) Felsenstein pruning likelihood for independent 2D wrapped-Brownian "
+        return "Spectral (FFT) Felsenstein pruning likelihood for independent d-dimensional wrapped-Brownian "
                 + "diffusions of protein backbone dihedrals on a flat torus.";
     }
 

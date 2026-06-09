@@ -16,11 +16,12 @@ import java.util.Arrays;
 import java.util.List;
 
 /**
- * Felsenstein pruning likelihood for independent 2D wrapped-Brownian diffusions
- * (one per residue) on a flat torus, computed by FFT heat-kernel propagation on a
- * power-of-two grid (see TorusFourierKernel). The windings are marginalised exactly
- * by the FFT, so no wrap augmentation is required. v1 recomputes all partials on
- * each evaluation; caching/threading are a later optimisation.
+ * Felsenstein pruning likelihood for independent d-dimensional wrapped-Brownian
+ * diffusions (one per residue) on a flat torus, computed by FFT heat-kernel
+ * propagation on a power-of-two grid (see TorusFourierKernel). The windings are
+ * marginalised exactly by the FFT, so no wrap augmentation is required. v1
+ * recomputes all partials on each evaluation; caching/threading are a later
+ * optimisation.
  *
  * @author Samir Bhatt
  */
@@ -31,11 +32,12 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
 
     private final Tree tree;
     private final BranchRateModel branchRateModel;     // nullable -> rate 1
-    private final List<MatrixParameter> precisions;    // one 2x2 precision per residue
-    private final double[][][] tipData;                // [residue][externalNodeNumber][2], radians
+    private final List<MatrixParameter> precisions;    // one dim x dim precision per residue
+    private final double[][][] tipData;                // [residue][externalNodeNumber][dim], radians
     private final TorusFourierKernel kernel;
     private final int nResidues;
     private final int n2;
+    private final int dim;
 
     private double logLikelihood;
     private boolean likelihoodKnown = false;
@@ -53,14 +55,16 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         this.kernel = kernel;
         this.nResidues = precisions.size();
         this.n2 = kernel.getGridCount();
+        this.dim = kernel.getDimension();
 
         for (int r = 0; r < nResidues; r++) {
             if (tipData[r].length != tree.getExternalNodeCount()) {
                 throw new IllegalArgumentException("tipData residue " + r + " has "
                         + tipData[r].length + " taxa, tree has " + tree.getExternalNodeCount());
             }
-            if (precisions.get(r).getRowDimension() != 2 || precisions.get(r).getColumnDimension() != 2) {
-                throw new IllegalArgumentException("precision " + r + " must be 2x2");
+            final MatrixParameter p = precisions.get(r);
+            if (p.getRowDimension() != dim || p.getColumnDimension() != dim) {
+                throw new IllegalArgumentException("precision " + r + " must be " + dim + "x" + dim);
             }
         }
         if (tree instanceof Model) addModel((Model) tree);
@@ -90,7 +94,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         final NodeRef root = tree.getRoot();
         double total = 0.0;
         for (int r = 0; r < nResidues; r++) {
-            final double[] sigma = invertPrecision(precisions.get(r));   // {s00, s01, s11}
+            final double[][] sigma = invertPrecision(precisions.get(r));
             final double[] logScale = new double[1];
             final double[] rootValues = nodeValues(r, root, sigma, logScale);
             total += logScale[0] + Math.log(kernel.rootIntegral(rootValues));
@@ -99,7 +103,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     }
 
     /** Post-order product of child messages at an internal node (mirrors prune_loglik). */
-    private double[] nodeValues(int r, NodeRef node, double[] sigma, double[] logScale) {
+    private double[] nodeValues(int r, NodeRef node, double[][] sigma, double[] logScale) {
         final double[] values = new double[n2];
         Arrays.fill(values, 1.0);
         for (int c = 0; c < tree.getChildCount(node); c++) {
@@ -107,11 +111,10 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             final double bl = branchLength(child);
             final double[] msg;
             if (tree.isExternal(child)) {
-                final double[] y = tipData[r][child.getNumber()];
-                msg = kernel.leafKernel(y[0], y[1], sigma[0], sigma[1], sigma[2], bl);
+                msg = kernel.leafKernel(tipData[r][child.getNumber()], sigma, bl);
             } else {
                 final double[] childValues = nodeValues(r, child, sigma, logScale);
-                msg = kernel.propagate(childValues, sigma[0], sigma[1], sigma[2], bl);
+                msg = kernel.propagate(childValues, sigma, bl);
             }
             double max = 0.0;
             for (int k = 0; k < n2; k++) {
@@ -135,14 +138,37 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         return bl > MIN_BRANCH ? bl : MIN_BRANCH;
     }
 
-    /** Invert a 2x2 precision matrix to a covariance {s00, s01, s11}. */
-    private double[] invertPrecision(MatrixParameter p) {
-        final double p00 = p.getParameterValue(0, 0);
-        final double p01 = p.getParameterValue(0, 1);
-        final double p11 = p.getParameterValue(1, 1);
-        final double det = p00 * p11 - p01 * p01;
-        if (!(det > 0.0)) throw new RuntimeException("Non-PD precision matrix, det = " + det);
-        return new double[]{p11 / det, -p01 / det, p00 / det};
+    /** Invert a dim x dim precision matrix to a covariance, by Gauss-Jordan elimination. */
+    private double[][] invertPrecision(MatrixParameter p) {
+        final int d = dim;
+        final double[][] a = new double[d][2 * d];
+        for (int i = 0; i < d; i++) {
+            for (int j = 0; j < d; j++) a[i][j] = p.getParameterValue(i, j);
+            a[i][d + i] = 1.0;
+        }
+        for (int col = 0; col < d; col++) {
+            int piv = col;
+            for (int rr = col + 1; rr < d; rr++) {
+                if (Math.abs(a[rr][col]) > Math.abs(a[piv][col])) piv = rr;
+            }
+            if (Math.abs(a[piv][col]) < 1.0e-300) {
+                throw new RuntimeException("Singular precision matrix");
+            }
+            final double[] tmp = a[col]; a[col] = a[piv]; a[piv] = tmp;
+            final double diag = a[col][col];
+            for (int j = 0; j < 2 * d; j++) a[col][j] /= diag;
+            for (int rr = 0; rr < d; rr++) {
+                if (rr != col) {
+                    final double f = a[rr][col];
+                    if (f != 0.0) for (int j = 0; j < 2 * d; j++) a[rr][j] -= f * a[col][j];
+                }
+            }
+        }
+        final double[][] inv = new double[d][d];
+        for (int i = 0; i < d; i++) {
+            for (int j = 0; j < d; j++) inv[i][j] = a[i][d + j];
+        }
+        return inv;
     }
 
     // ---- Model bookkeeping (v1: any change invalidates the whole likelihood) ----
