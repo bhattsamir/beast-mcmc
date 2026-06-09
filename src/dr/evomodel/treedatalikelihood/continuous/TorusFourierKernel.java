@@ -72,31 +72,54 @@ public class TorusFourierKernel {
 
     /** Per-mode Brownian damping exp(-1/2 t m^T Sigma m), Sigma a dim x dim covariance. */
     public double[] dampingFourier(double[][] sigma, double t) {
-        final double[] d = new double[nTotal];
+        return transferMultiplier(sigma, t, 0.0, null);
+    }
+
+    /** Quadratic form m^T S m for a symmetric dim x dim matrix S. */
+    private double quadForm(double[][] s, double[] m) {
+        double q = 0.0;
+        for (int i = 0; i < dim; i++) {
+            q += s[i][i] * m[i] * m[i];
+            for (int j = i + 1; j < dim; j++) q += 2.0 * s[i][j] * m[i] * m[j];
+        }
+        return q;
+    }
+
+    /**
+     * Per-mode transfer multiplier exp(t * psi(m)) of a wrapped Levy diffusion, with
+     * Levy-Khintchine characteristic exponent
+     *     psi(m) = -1/2 m^T Sigma m + jumpRate (exp(-1/2 m^T Sigma_J m) - 1)
+     * (Brownian + compound-Poisson jumps with wrapped-normal jump covariance Sigma_J).
+     * jumpRate <= 0 or sigmaJump == null gives pure Brownian motion.
+     */
+    private double[] transferMultiplier(double[][] sigma, double t, double jumpRate, double[][] sigmaJump) {
+        final boolean hasJump = jumpRate > 0.0 && sigmaJump != null;
+        final double[] out = new double[nTotal];
         final double[] m = new double[dim];
         for (int idx = 0; idx < nTotal; idx++) {
             modeOf(idx, m);
-            double quad = 0.0;
-            for (int i = 0; i < dim; i++) {
-                quad += sigma[i][i] * m[i] * m[i];
-                for (int j = i + 1; j < dim; j++) {
-                    quad += 2.0 * sigma[i][j] * m[i] * m[j];
-                }
-            }
-            d[idx] = Math.exp(-0.5 * t * quad);
+            double psi = -0.5 * quadForm(sigma, m);
+            if (hasJump) psi += jumpRate * (Math.exp(-0.5 * quadForm(sigmaJump, m)) - 1.0);
+            out[idx] = Math.exp(t * psi);
         }
-        return d;
+        return out;
     }
 
-    /** Propagate a non-negative grid partial across a branch of length t. */
+    /** Propagate a non-negative grid partial across a branch of length t (Brownian). */
     public double[] propagate(double[] partial, double[][] sigma, double t) {
+        return propagate(partial, sigma, t, 0.0, null);
+    }
+
+    /** Propagate across a branch under Brownian motion + compound-Poisson jumps. */
+    public double[] propagate(double[] partial, double[][] sigma, double t,
+                              double jumpRate, double[][] sigmaJump) {
         final double[] re = partial.clone();
         final double[] im = new double[nTotal];
         fftN(re, im, false);
-        final double[] damp = dampingFourier(sigma, t);
+        final double[] mult = transferMultiplier(sigma, t, jumpRate, sigmaJump);
         for (int k = 0; k < nTotal; k++) {
-            re[k] *= damp[k];
-            im[k] *= damp[k];
+            re[k] *= mult[k];
+            im[k] *= mult[k];
         }
         fftN(re, im, true);                               // == numpy ifftn
         for (int k = 0; k < nTotal; k++) {
@@ -105,9 +128,15 @@ public class TorusFourierKernel {
         return re;
     }
 
-    /** Heat kernel K_t(grid - y) for a tip observation y (dim angles, radians). */
+    /** Heat kernel K_t(grid - y) for a tip observation y (dim angles, radians; Brownian). */
     public double[] leafKernel(double[] y, double[][] sigma, double t) {
-        final double[] damp = dampingFourier(sigma, t);
+        return leafKernel(y, sigma, t, 0.0, null);
+    }
+
+    /** Leaf heat kernel under Brownian motion + compound-Poisson jumps. */
+    public double[] leafKernel(double[] y, double[][] sigma, double t,
+                               double jumpRate, double[][] sigmaJump) {
+        final double[] mult = transferMultiplier(sigma, t, jumpRate, sigmaJump);
         final double[] re = new double[nTotal];
         final double[] im = new double[nTotal];
         final double[] m = new double[dim];
@@ -116,7 +145,7 @@ public class TorusFourierKernel {
             modeOf(idx, m);
             double phase = 0.0;
             for (int ax = 0; ax < dim; ax++) phase += m[ax] * y[ax];
-            final double c = scale * damp[idx];
+            final double c = scale * mult[idx];
             re[idx] = c * Math.cos(phase);                // exp(-i phase)
             im[idx] = -c * Math.sin(phase);
         }

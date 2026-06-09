@@ -49,6 +49,24 @@ public class TorusFourierTest extends TestCase {
         assertEquals(-6.69298747149, ll, 1.0e-6);
     }
 
+    /** Kernel with compound-Poisson jumps: two-tip likelihood vs the prototype. */
+    public void testKernelTwoTipJumps() {
+        TorusFourierKernel g = new TorusFourierKernel(2, 128);
+        double[][] sigma = {{0.35, 0.08}, {0.08, 0.22}};
+        double[][] sigmaJump = {{0.6, 0.0}, {0.0, 0.5}};
+        double rate = 0.8;
+        double[] mA = g.leafKernel(new double[]{0.4, 1.1}, sigma, 0.7, rate, sigmaJump);
+        double[] mB = g.leafKernel(new double[]{-1.2, 0.6}, sigma, 1.4, rate, sigmaJump);
+        int n = g.getGridCount();
+        double[] v = new double[n];
+        Arrays.fill(v, 1.0);
+        double logScale = 0.0;
+        logScale += multiplyInto(v, mA);
+        logScale += multiplyInto(v, mB);
+        double ll = logScale + Math.log(g.rootIntegral(v));
+        assertEquals(-6.72524483142, ll, 1.0e-6);
+    }
+
     public void testLikelihoodP1() throws Exception {
         Map<String, double[]> obs = new HashMap<String, double[]>();
         obs.put("A", new double[]{0.4});
