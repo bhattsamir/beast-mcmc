@@ -154,6 +154,67 @@ public class TorusFourierKernel {
         return TWO_PI * (double) ((idx / stride[ax]) % nGrid) / (double) nGrid;
     }
 
+    /** NaN denotes an unobserved coordinate. A null vector has no observations. */
+    private int[] observedAxes(double[] y) {
+        if (y == null) return new int[0];
+        if (y.length != dim) throw new IllegalArgumentException("Tip dimension mismatch");
+        int count = 0;
+        for (double value : y) {
+            if (Double.isInfinite(value)) throw new IllegalArgumentException("Observed tip angles must be finite");
+            if (!Double.isNaN(value)) count++;
+        }
+        int[] axes = new int[count];
+        int next = 0;
+        for (int ax = 0; ax < dim; ax++) if (!Double.isNaN(y[ax])) axes[next++] = ax;
+        return axes;
+    }
+
+    private double[] neutralLeaf() {
+        double[] values = new double[nTotal];
+        java.util.Arrays.fill(values, 1.0);
+        return values;
+    }
+
+    private double[] projectPoint(double[] y, int[] axes) {
+        double[] point = new double[axes.length];
+        for (int ax = 0; ax < axes.length; ax++) point[ax] = y[axes[ax]];
+        return point;
+    }
+
+    private double[][] projectMatrix(double[][] matrix, int[] axes) {
+        double[][] projected = new double[axes.length][axes.length];
+        for (int i = 0; i < axes.length; i++) for (int j = 0; j < axes.length; j++)
+            projected[i][j] = matrix[axes[i]][axes[j]];
+        return projected;
+    }
+
+    /** Embed a reduced Fourier mode with frequency zero in every missing axis.
+     * Grid indices use the same ordering, so this also embeds grid coordinates. */
+    private int embeddedIndex(int index, TorusFourierKernel reduced, int[] axes) {
+        int full = 0;
+        for (int ax = 0; ax < axes.length; ax++)
+            full += ((index / reduced.stride[ax]) % nGrid) * stride[axes[ax]];
+        return full;
+    }
+
+    private double[] projectModes(double[] full, TorusFourierKernel reduced, int[] axes) {
+        if (full == null) return null;
+        double[] projected = new double[reduced.nTotal];
+        for (int i = 0; i < projected.length; i++) projected[i] = full[embeddedIndex(i, reduced, axes)];
+        return projected;
+    }
+
+    /** A marginalized tip is constant along every unobserved parent coordinate. */
+    private double[] broadcastLeaf(double[] reduced, int[] axes) {
+        double[] full = new double[nTotal];
+        for (int index = 0; index < nTotal; index++) {
+            int projected = 0;
+            for (int axis : axes) projected = projected * nGrid + (index / stride[axis]) % nGrid;
+            full[index] = reduced[projected];
+        }
+        return full;
+    }
+
     /** Cholesky inverse of a small SPD matrix; returns log|a|. */
     private double symmetricInverse(double[][] a, double[][] inv) {
         final int n = a.length;
@@ -253,6 +314,14 @@ public class TorusFourierKernel {
      */
     private double[] leafKernelSplit(double[] y, double[][] sigma, double t,
                                      double jumpRate, double[] multRe, double[] multIm) {
+        final int[] axes = observedAxes(y);
+        if (axes.length == 0) return neutralLeaf();
+        if (axes.length < dim) {
+            TorusFourierKernel reduced = new TorusFourierKernel(axes.length, nGrid);
+            double[] marginal = reduced.leafKernelSplit(projectPoint(y, axes), projectMatrix(sigma, axes),
+                    t, jumpRate, projectModes(multRe, reduced, axes), projectModes(multIm, reduced, axes));
+            return broadcastLeaf(marginal, axes);
+        }
         final double lamT = jumpRate * t;
         final double[] bm = transferMultiplier(sigma, t, 0.0, null);
         final double weight = Math.exp(-lamT);
@@ -281,6 +350,7 @@ public class TorusFourierKernel {
     /** Leaf heat kernel under Brownian motion + compound-Poisson jumps. */
     public double[] leafKernel(double[] y, double[][] sigma, double t,
                                double jumpRate, double[][] sigmaJump) {
+        if (observedAxes(y).length == 0) return neutralLeaf();
         return leafKernelSplit(y, sigma, t, jumpRate,
                                transferMultiplier(sigma, t, jumpRate, sigmaJump), null);
     }
@@ -343,6 +413,7 @@ public class TorusFourierKernel {
     /** Leaf heat kernel under BM + a directed jump mixture (complex multiplier). */
     public double[] leafKernel(double[] y, double[][] sigma, double t, double jumpRate,
                                double[] w, double[][] d, double[][][] s) {
+        if (observedAxes(y).length == 0) return neutralLeaf();
         final double[] mRe = new double[nTotal];
         final double[] mIm = new double[nTotal];
         transferMultiplierComplex(sigma, t, jumpRate, w, d, s, mRe, mIm);
@@ -417,12 +488,341 @@ public class TorusFourierKernel {
     /** leafKernel() using a precomputed psi (see computePsiComplex). */
     public double[] leafKernelFromPsi(double[] y, double t, double[] psiRe, double[] psiIm,
                                       double[][] sigma, double jumpRate) {
+        if (observedAxes(y).length == 0) return neutralLeaf();
         // sigma and jumpRate are required: the zero-jump term e^{-lam t} W_{t Sigma} is
         // evaluated analytically and cannot be recovered from psi alone.
         final double[] mRe = new double[nTotal];
         final double[] mIm = new double[nTotal];
         multiplierFromPsi(t, psiRe, psiIm, mRe, mIm);
         return leafKernelSplit(y, sigma, t, jumpRate, mRe, mIm);
+    }
+
+    // ---- analytic directional derivatives for the production FFT likelihood ----
+
+    /** Residue-specific spectral data, reused across all branches in a gradient sweep.
+     * Directions are derivatives of covariance and jump rate with respect to the
+     * caller's parameters; fixed mixture weights, means and covariances do not vary. */
+    public static final class GradientContext {
+        private final TorusFourierKernel owner;
+        private final double[][] sigma;
+        private final double[][][] sigmaDirections;
+        private final double[] rateDirections;
+        private final double rate;
+        private final boolean hasLaw;
+        private final double[] psiRe, psiIm, phiRe, phiIm;
+        private final double[][] brownianGradient, psiGradientRe, psiGradientIm;
+
+        private GradientContext(TorusFourierKernel owner, double[][] sigma,
+                                double[][][] sigmaDirections, double[] rateDirections,
+                                double rate, boolean hasLaw) {
+            this.owner = owner;
+            this.sigma = sigma;
+            this.sigmaDirections = sigmaDirections;
+            this.rateDirections = rateDirections;
+            this.rate = rate;
+            this.hasLaw = hasLaw;
+            int size = owner.nTotal, parameters = rateDirections.length;
+            psiRe = new double[size]; psiIm = new double[size];
+            phiRe = new double[size]; phiIm = new double[size];
+            brownianGradient = new double[parameters][size];
+            psiGradientRe = new double[parameters][size];
+            psiGradientIm = new double[parameters][size];
+        }
+
+        public int getParameterCount() { return rateDirections.length; }
+    }
+
+    /** Unscaled values and directional derivatives, gradients[parameter][grid cell]. */
+    public static final class ValueGradient {
+        public final double[] values;
+        public final double[][] gradients;
+
+        private ValueGradient(double[] values, double[][] gradients) {
+            this.values = values;
+            this.gradients = gradients;
+        }
+    }
+
+    private double[][] copyGradientMatrix(double[][] matrix, String name) {
+        if (matrix == null || matrix.length != dim)
+            throw new IllegalArgumentException(name + " has the wrong dimension");
+        double[][] copy = new double[dim][dim];
+        for (int i = 0; i < dim; i++) {
+            if (matrix[i] == null || matrix[i].length != dim)
+                throw new IllegalArgumentException(name + " has the wrong dimension");
+            for (int j = 0; j < dim; j++) {
+                if (!Double.isFinite(matrix[i][j]))
+                    throw new IllegalArgumentException(name + " must be finite");
+                copy[i][j] = matrix[i][j];
+            }
+        }
+        return copy;
+    }
+
+    /** Cache psi and its analytic derivatives once per residue. An absent jump law
+     * disables the rate, as in the tree likelihood. At rate zero a present law
+     * supplies the right derivative with respect to the nonnegative rate. */
+    public GradientContext prepareGradientContext(double[][] sigma, double jumpRate,
+                                                  double[] w, double[][] d, double[][][] s,
+                                                  double[][][] dSigma, double[] dRate) {
+        if (dSigma == null || dRate == null || dSigma.length != dRate.length)
+            throw new IllegalArgumentException("Covariance and rate directions must have equal length");
+        if (!Double.isFinite(jumpRate) || jumpRate < 0.0)
+            throw new IllegalArgumentException("Gradient jump rate must be finite and nonnegative");
+        final boolean hasLaw = w != null && d != null && s != null;
+        if (hasLaw && (w.length != d.length || w.length != s.length))
+            throw new IllegalArgumentException("Jump mixture dimensions disagree");
+        final double[][] cov = copyGradientMatrix(sigma, "Sigma");
+        final double[][][] directions = new double[dRate.length][][];
+        final double[] rateDirections = new double[dRate.length];
+        for (int p = 0; p < dRate.length; p++) {
+            directions[p] = copyGradientMatrix(dSigma[p], "Covariance direction");
+            if (!Double.isFinite(dRate[p]))
+                throw new IllegalArgumentException("Rate directions must be finite");
+            rateDirections[p] = hasLaw ? dRate[p] : 0.0;
+        }
+        if (hasLaw) {
+            for (int k = 0; k < w.length; k++) {
+                if (!Double.isFinite(w[k]) || d[k] == null || d[k].length != dim)
+                    throw new IllegalArgumentException("Invalid jump mixture component");
+                copyGradientMatrix(s[k], "Jump covariance");
+                for (double value : d[k]) if (!Double.isFinite(value))
+                    throw new IllegalArgumentException("Jump means must be finite");
+            }
+        }
+        final GradientContext context = new GradientContext(this, cov, directions,
+                rateDirections, hasLaw ? jumpRate : 0.0, hasLaw);
+        final double[] m = new double[dim];
+        for (int idx = 0; idx < nTotal; idx++) {
+            modeOf(idx, m);
+            double phiRe = 0.0, phiIm = 0.0;
+            if (hasLaw) {
+                for (int k = 0; k < w.length; k++) {
+                    double g = w[k] * Math.exp(-0.5 * quadForm(s[k], m));
+                    double phase = 0.0;
+                    for (int ax = 0; ax < dim; ax++) phase += m[ax] * d[k][ax];
+                    phiRe += g * Math.cos(phase);
+                    phiIm += g * Math.sin(phase);
+                }
+            }
+            context.phiRe[idx] = phiRe;
+            context.phiIm[idx] = phiIm;
+            context.psiRe[idx] = -0.5 * quadForm(cov, m);
+            if (hasLaw && jumpRate > 0.0) {
+                context.psiRe[idx] += jumpRate * (phiRe - 1.0);
+                context.psiIm[idx] = jumpRate * phiIm;
+            }
+            for (int p = 0; p < dRate.length; p++) {
+                double brownian = -0.5 * quadForm(directions[p], m);
+                context.brownianGradient[p][idx] = brownian;
+                context.psiGradientRe[p][idx] = brownian + rateDirections[p] * (phiRe - 1.0);
+                context.psiGradientIm[p][idx] = rateDirections[p] * phiIm;
+            }
+        }
+        return context;
+    }
+
+    private void checkGradientBranch(double t, GradientContext context) {
+        if (context == null || context.owner != this)
+            throw new IllegalArgumentException("Gradient context belongs to a different grid");
+        if (!(t > 0.0) || !Double.isFinite(t))
+            throw new IllegalArgumentException("Gradient branch length must be finite and positive");
+    }
+
+    private void checkGradientResult(double[] values, double[][] gradients) {
+        for (int idx = 0; idx < nTotal; idx++) {
+            if (!Double.isFinite(values[idx]))
+                throw new ArithmeticException("Non-finite kernel value in analytic gradient");
+            if (values[idx] <= MIN_POS) {
+                values[idx] = MIN_POS;
+                for (double[] gradient : gradients) gradient[idx] = 0.0;
+            }
+            for (double[] gradient : gradients) if (!Double.isFinite(gradient[idx]))
+                throw new ArithmeticException("Non-finite analytic kernel gradient");
+        }
+    }
+
+    /** Forward derivative of branch propagation, including input-partial derivatives.
+     * Floored output cells have zero derivatives. The caller handles any rescaling. */
+    public ValueGradient propagateWithGradient(double[] partial, double[][] partialGradients,
+                                                double t, GradientContext context) {
+        checkGradientBranch(t, context);
+        final int parameters = context.getParameterCount();
+        if (partial == null || partial.length != nTotal || partialGradients == null
+                || partialGradients.length != parameters)
+            throw new IllegalArgumentException("Partial gradient dimensions disagree");
+        final double[] re = partial.clone(), im = new double[nTotal];
+        for (double value : re) if (!Double.isFinite(value))
+            throw new IllegalArgumentException("Partial values must be finite");
+        fftN(re, im, false);
+        final double[][] gradientRe = new double[parameters][], gradientIm = new double[parameters][nTotal];
+        for (int p = 0; p < parameters; p++) {
+            if (partialGradients[p] == null || partialGradients[p].length != nTotal)
+                throw new IllegalArgumentException("Partial gradient dimensions disagree");
+            gradientRe[p] = partialGradients[p].clone();
+            for (double value : gradientRe[p]) if (!Double.isFinite(value))
+                throw new IllegalArgumentException("Partial derivatives must be finite");
+            fftN(gradientRe[p], gradientIm[p], false);
+        }
+        final double[] mRe = new double[nTotal], mIm = new double[nTotal];
+        multiplierFromPsi(t, context.psiRe, context.psiIm, mRe, mIm);
+        for (int idx = 0; idx < nTotal; idx++) {
+            double ar = re[idx], ai = im[idx];
+            re[idx] = ar * mRe[idx] - ai * mIm[idx];
+            im[idx] = ar * mIm[idx] + ai * mRe[idx];
+            for (int p = 0; p < parameters; p++) {
+                double gr = gradientRe[p][idx], gi = gradientIm[p][idx];
+                double pr = context.psiGradientRe[p][idx], pi = context.psiGradientIm[p][idx];
+                gradientRe[p][idx] = gr * mRe[idx] - gi * mIm[idx]
+                        + t * (pr * re[idx] - pi * im[idx]);
+                gradientIm[p][idx] = gr * mIm[idx] + gi * mRe[idx]
+                        + t * (pr * im[idx] + pi * re[idx]);
+            }
+        }
+        fftN(re, im, true);
+        for (int p = 0; p < parameters; p++) fftN(gradientRe[p], gradientIm[p], true);
+        checkGradientResult(re, gradientRe);
+        return new ValueGradient(re, gradientRe);
+    }
+
+    /** Analytic derivative of the production split tip, with the same winding
+     * radius, observation coordinates and clipping as leafKernelSplit(). */
+    public ValueGradient leafKernelWithGradient(double[] y, double t, GradientContext context) {
+        checkGradientBranch(t, context);
+        final int parameters = context.getParameterCount();
+        final int[] axes = observedAxes(y);
+        if (axes.length == 0) return new ValueGradient(neutralLeaf(), new double[parameters][nTotal]);
+        if (axes.length < dim) {
+            TorusFourierKernel reduced = new TorusFourierKernel(axes.length, nGrid);
+            double[][][] directions = new double[parameters][][];
+            for (int p = 0; p < parameters; p++) directions[p] = projectMatrix(context.sigmaDirections[p], axes);
+            GradientContext marginal = new GradientContext(reduced, projectMatrix(context.sigma, axes),
+                    directions, context.rateDirections.clone(), context.rate, context.hasLaw);
+            for (int index = 0; index < reduced.nTotal; index++) {
+                int full = embeddedIndex(index, reduced, axes);
+                marginal.psiRe[index] = context.psiRe[full];
+                marginal.psiIm[index] = context.psiIm[full];
+                marginal.phiRe[index] = context.phiRe[full];
+                marginal.phiIm[index] = context.phiIm[full];
+                for (int p = 0; p < parameters; p++) {
+                    marginal.brownianGradient[p][index] = context.brownianGradient[p][full];
+                    marginal.psiGradientRe[p][index] = context.psiGradientRe[p][full];
+                    marginal.psiGradientIm[p][index] = context.psiGradientIm[p][full];
+                }
+            }
+            ValueGradient result = reduced.leafKernelWithGradient(projectPoint(y, axes), t, marginal);
+            double[][] gradients = new double[parameters][];
+            for (int p = 0; p < parameters; p++) gradients[p] = broadcastLeaf(result.gradients[p], axes);
+            return new ValueGradient(broadcastLeaf(result.values, axes), gradients);
+        }
+        final double[] mRe = new double[nTotal], mIm = new double[nTotal];
+        multiplierFromPsi(t, context.psiRe, context.psiIm, mRe, mIm);
+        final double[] bm = transferMultiplier(context.sigma, t, 0.0, null);
+        final double weight = Math.exp(-context.rate * t);
+        final double[] re = new double[nTotal], im = new double[nTotal], m = new double[dim];
+        final double[][] gradientRe = new double[parameters][nTotal], gradientIm = new double[parameters][nTotal];
+        final double scale = (double) nTotal / volume;
+        int rateDirection = -1;
+        for (int p = 0; p < parameters; p++) if (context.rateDirections[p] != 0.0) {
+            rateDirection = p;
+            break;
+        }
+        for (int idx = 0; idx < nTotal; idx++) {
+            modeOf(idx, m);
+            double phase = 0.0;
+            for (int ax = 0; ax < dim; ax++) phase += m[ax] * y[ax];
+            final double cp = Math.cos(phase), sp = Math.sin(phase);
+            final double dr = mRe[idx] - weight * bm[idx], di = mIm[idx];
+            re[idx] = scale * (dr * cp + di * sp);
+            im[idx] = scale * (di * cp - dr * sp);
+            for (int p = 0; p < parameters; p++) {
+                // dD/dSigma = t*dpsi_B*D; dD/dlambda = t*(phi*A-D).
+                // This form retains the nonzero right derivative at lambda=0.
+                double br = context.brownianGradient[p][idx], lr = context.rateDirections[p];
+                double gr = t * (br * dr + lr * (context.phiRe[idx] * mRe[idx]
+                        - context.phiIm[idx] * mIm[idx] - dr));
+                double gi = t * (br * di + lr * (context.phiRe[idx] * mIm[idx]
+                        + context.phiIm[idx] * mRe[idx] - di));
+                gradientRe[p][idx] = scale * (gr * cp + gi * sp);
+                gradientIm[p][idx] = scale * (gi * cp - gr * sp);
+            }
+        }
+        fftN(re, im, true);
+        for (int p = 0; p < parameters; p++) fftN(gradientRe[p], gradientIm[p], true);
+        for (int idx = 0; idx < nTotal; idx++) {
+            boolean active = re[idx] > 0.0;
+            if (context.hasLaw && context.rate == 0.0 && rateDirection >= 0) {
+                active = gradientRe[rateDirection][idx] / context.rateDirections[rateDirection] > 0.0;
+            }
+            if (!active) for (int p = 0; p < parameters; p++) gradientRe[p][idx] = 0.0;
+            if (re[idx] < 0.0) re[idx] = 0.0;
+        }
+        addLatticeAtomWithGradient(re, gradientRe, y, t, context);
+        checkGradientResult(re, gradientRe);
+        return new ValueGradient(re, gradientRe);
+    }
+
+    private void addLatticeAtomWithGradient(double[] out, double[][] gradients,
+                                            double[] y, double t, GradientContext context) {
+        final int parameters = context.getParameterCount();
+        final double[][] cov = new double[dim][dim];
+        for (int i = 0; i < dim; i++) for (int j = 0; j < dim; j++) cov[i][j] = t * context.sigma[i][j];
+        final double[][] inv = new double[dim][dim];
+        final double logDet = symmetricInverse(cov, inv);
+        double bound = 0.0;
+        for (int i = 0; i < dim; i++) {
+            double row = 0.0;
+            for (int j = 0; j < dim; j++) row += Math.abs(cov[i][j]);
+            if (row > bound) bound = row;
+        }
+        final int kmax = (int) Math.ceil(6.0 * Math.sqrt(bound) / TWO_PI) + 1;
+        final int span = 2 * kmax + 1;
+        int combos = 1;
+        for (int i = 0; i < dim; i++) {
+            if (span <= 0 || combos > Integer.MAX_VALUE / span)
+                throw new ArithmeticException("Winding image count exceeds integer range");
+            combos *= span;
+        }
+        final double logNorm = -context.rate * t - 0.5 * (dim * Math.log(TWO_PI) + logDet);
+        final double[] trace = new double[parameters];
+        for (int p = 0; p < parameters; p++) for (int i = 0; i < dim; i++)
+            for (int j = 0; j < dim; j++) trace[p] += t * inv[i][j] * context.sigmaDirections[p][j][i];
+        final double[] delta = new double[dim], solved = new double[dim], q = new double[combos];
+        final double[][] score = new double[parameters][combos];
+        for (int idx = 0; idx < nTotal; idx++) {
+            double qmin = Double.POSITIVE_INFINITY;
+            for (int c = 0; c < combos; c++) {
+                int rem = c;
+                for (int ax = 0; ax < dim; ax++) {
+                    final int k = rem % span - kmax;
+                    rem /= span;
+                    delta[ax] = angleOf(idx, ax) - y[ax] + TWO_PI * k;
+                }
+                double form = 0.0;
+                for (int i = 0; i < dim; i++) {
+                    solved[i] = 0.0;
+                    for (int j = 0; j < dim; j++) {
+                        form += inv[i][j] * delta[i] * delta[j];
+                        solved[i] += inv[i][j] * delta[j];
+                    }
+                }
+                q[c] = form;
+                if (form < qmin) qmin = form;
+                for (int p = 0; p < parameters; p++)
+                    score[p][c] = 0.5 * (t * quadForm(context.sigmaDirections[p], solved) - trace[p])
+                            - t * context.rateDirections[p];
+            }
+            double acc = 0.0;
+            final double[] derivative = new double[parameters];
+            for (int c = 0; c < combos; c++) {
+                double term = Math.exp(-0.5 * (q[c] - qmin));
+                acc += term;
+                if (term != 0.0) for (int p = 0; p < parameters; p++) derivative[p] += term * score[p][c];
+            }
+            final double atom = Math.exp(logNorm + Math.log(acc) - 0.5 * qmin);
+            out[idx] += atom;
+            if (atom != 0.0) for (int p = 0; p < parameters; p++) gradients[p][idx] += atom * (derivative[p] / acc);
+        }
     }
 
     // ---- ancestral-reconstruction support: real-space transition kernel + grid-cell samplers ----

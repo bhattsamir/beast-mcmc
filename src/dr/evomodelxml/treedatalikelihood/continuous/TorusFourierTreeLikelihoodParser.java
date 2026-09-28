@@ -187,11 +187,9 @@ public class TorusFourierTreeLikelihoodParser extends AbstractXMLObjectParser {
         return m;
     }
 
-    /** Parse a taxon attribute holding dim angles (radians). Returns null if the residue is
-     *  MISSING at this taxon -- a "NA"/"?" token or NaN -- using BEAST's convention
-     *  (TreeTraitParserUtilities.isMissing), the same one continuousTraitDataModel uses, so the
-     *  identical trait encoding works for the Gaussian and torus likelihoods. A null tip is
-     *  masked in the likelihood (flat leaf message, marginalised out -- not imputed). */
+    /** Parse angles in radians, retaining observed coordinates. Missing coordinates
+     *  are NaN and are integrated out by the tip kernel; an entirely missing vector
+     *  is null and contributes a constant-one message. */
     private double[] parseVector(Object attr, int dim, String traitName, Taxon taxon) throws XMLParseException {
         final String who = (taxon == null) ? "?" : taxon.getId();
         if (attr == null) {
@@ -214,12 +212,24 @@ public class TorusFourierTreeLikelihoodParser extends AbstractXMLObjectParser {
             throw new XMLParseException("attribute '" + traitName + "' needs " + dim + " values for " + who);
         }
         final double[] v = new double[dim];
+        boolean observed = false;
         for (int i = 0; i < dim; i++) {
-            if (TreeTraitParserUtilities.isMissing(toks[i])) return null;   // residue absent here -> masked
-            v[i] = Double.parseDouble(toks[i]);
-            if (Double.isNaN(v[i])) return null;                           // NaN also means missing
+            if (TreeTraitParserUtilities.isMissing(toks[i])) {
+                v[i] = Double.NaN;
+            } else {
+                try {
+                    v[i] = Double.parseDouble(toks[i]);
+                } catch (NumberFormatException invalid) {
+                    throw new XMLParseException("Invalid angle '" + toks[i] + "' in trait '"
+                            + traitName + "' for " + who);
+                }
+                if (Double.isInfinite(v[i])) {
+                    throw new XMLParseException("Infinite angle in trait '" + traitName + "' for " + who);
+                }
+                observed |= !Double.isNaN(v[i]);
+            }
         }
-        return v;
+        return observed ? v : null;
     }
 
     public XMLSyntaxRule[] getSyntaxRules() {
