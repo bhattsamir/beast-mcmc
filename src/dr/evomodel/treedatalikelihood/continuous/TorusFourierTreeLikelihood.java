@@ -413,13 +413,10 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         stream.forEach(r -> {
             final double[][] sigma = invertPrecision(precisions.get(r));
             final double jr = jumpRateValue(r);
-            double[] psiRe = null, psiIm = null;
-            if (jr > 0.0 && jumpS != null) {     // precompute the branch-independent jump exponent once per residue
-                psiRe = new double[n2];
-                psiIm = new double[n2];
-                kernel.computePsiComplex(sigma, jr, jumpW, jumpD, jumpS, psiRe, psiIm);
-            }
-            boolean changed = updateNodePartial(r, root, sigma, psiRe, psiIm, jr);
+            // The branch-independent jump exponent is needed once per residue, but only if
+            // some node in this residue actually recomputes; see PsiCache.
+            final PsiCache psi = new PsiCache(sigma, jr);
+            boolean changed = updateNodePartial(r, root, sigma, psi, jr);
             if (changed || Double.isNaN(acceptedResidueLogL[r])) {
                 final int rn = root.getNumber();
                 double fft = nodeLogScale[r][rn]
@@ -450,12 +447,55 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     }
 
     /**
+     * The Levy-Khintchine exponent psi(m) for one residue, computed on first use.
+     *
+     * <p>psi depends only on the residue's covariance, its jump rate and the (fixed)
+     * mixture -- not on any branch -- so it is computed once per residue per evaluation
+     * and reused by every branch. It used to be computed eagerly, before
+     * {@link #updateNodePartial} had consulted the dirty flags, which meant a move that
+     * touches one residue still paid for all of them: two double[nGrid^dim] and a full
+     * grid pass each (318 residues x 2.7 ms = 0.86 s per evaluation at nGrid 128), every
+     * bit of it discarded. Deferring to the first node that actually recomputes changes
+     * no arithmetic -- psi is a pure function of state that is re-read each evaluation,
+     * and computePsiComplex has no side effects beyond the arrays passed to it -- while
+     * making a clean residue cost nothing.
+     *
+     * <p>Confined to a single residue's recursion, which is single-threaded: the parallel
+     * stream in {@link #calculateLogLikelihood} fans out over residues, never within one.
+     * So no synchronisation is needed.
+     */
+    private final class PsiCache {
+        /** Whether this residue has jumps at all. Known without computing psi. */
+        final boolean hasJump;
+        private final double[][] sigma;
+        private final double rate;
+        private double[] re, im;
+
+        PsiCache(double[][] sigma, double rate) {
+            this.sigma = sigma;
+            this.rate = rate;
+            this.hasJump = rate > 0.0 && jumpS != null;
+        }
+
+        private void ensure() {
+            if (re == null) {
+                re = new double[n2];
+                im = new double[n2];
+                kernel.computePsiComplex(sigma, rate, jumpW, jumpD, jumpS, re, im);
+            }
+        }
+
+        double[] re() { ensure(); return re; }
+        double[] im() { ensure(); return im; }
+    }
+
+    /**
      * Ensure node's cached partial (and subtree log-scale) for residue r are current,
      * recomputing iff the node is flagged, the residue's precision changed, or a child
      * was recomputed. Returns whether this node was recomputed, so the parent can
      * propagate the dirty path upward. Mirrors prune_loglik on a cache miss.
      */
-    private boolean updateNodePartial(int r, NodeRef node, double[][] sigma, double[] psiRe, double[] psiIm,
+    private boolean updateNodePartial(int r, NodeRef node, double[][] sigma, PsiCache psi,
                                       double jumpRate) {
         final int nn = node.getNumber();
         final int childCount = tree.getChildCount(node);
@@ -464,7 +504,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         for (int c = 0; c < childCount; c++) {
             final NodeRef child = tree.getChild(node, c);
             if (!tree.isExternal(child)) {
-                childRecomputed |= updateNodePartial(r, child, sigma, psiRe, psiIm, jumpRate);
+                childRecomputed |= updateNodePartial(r, child, sigma, psi, jumpRate);
             } else {
                 // Tips hold no cached partial (the leaf message is rebuilt on the fly),
                 // so their own dirty flag must be consulted here: a sampled tip-date or
@@ -484,7 +524,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         final int writeIndex = 1 - (stateStored ? storedCurrentIndex[r][nn] : currentIndex[r][nn]);
         final double[] values = partials[writeIndex][r][nn];
         Arrays.fill(values, 1.0);
-        final boolean hasJump = psiRe != null;
+        final boolean hasJump = psi.hasJump;
         double scale = 0.0;
         for (int c = 0; c < childCount; c++) {
             final NodeRef child = tree.getChild(node, c);
@@ -495,13 +535,13 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
                 if (y == null) {                          // masked: residue absent at this taxon
                     msg = flatLeaf;                       // flat -> tip value marginalised out
                 } else {
-                    msg = hasJump ? kernel.leafKernelFromPsi(y, bl, psiRe, psiIm, sigma, jumpRate)
+                    msg = hasJump ? kernel.leafKernelFromPsi(y, bl, psi.re(), psi.im(), sigma, jumpRate)
                                   : kernel.leafKernel(y, sigma, bl);
                 }
             } else {
                 final int cn = child.getNumber();
                 final double[] cv = partials[currentIndex[r][cn]][r][cn];
-                msg = hasJump ? kernel.propagateFromPsi(cv, bl, psiRe, psiIm)
+                msg = hasJump ? kernel.propagateFromPsi(cv, bl, psi.re(), psi.im())
                               : kernel.propagate(cv, sigma, bl);
                 scale += nodeLogScale[r][cn];   // carry the child's subtree scale
             }
