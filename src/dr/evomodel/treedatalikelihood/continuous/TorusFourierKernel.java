@@ -32,6 +32,9 @@ public class TorusFourierKernel {
     // accepts a candidate only after checking the positive log-space reference.
     private static final double MIN_POS = Double.MIN_NORMAL;
     private static final double TWO_PI = 2.0 * Math.PI;
+    // Grid-resolution margin used by requiredGrid(): cells per standard deviation, i.e.
+    // n >= 2*pi*SHARPNESS_MARGIN/sd. Diagnostic only.
+    private static final double SHARPNESS_MARGIN = 1.05;
 
     /**
      * Centre the analytic winding-image window on the nearest image instead of on k = 0.
@@ -182,6 +185,17 @@ public class TorusFourierKernel {
         return leafKernel(y, sigma, t, 0.0, null);
     }
 
+    /**
+     * Heat kernel for a tip observed with wrapped-Gaussian error (Brownian).
+     *
+     * sigmaEps is the tip observation-error COVARIANCE (radians^2). null -- or, from the
+     * likelihood, an exactly-zero Sigma_eps -- is the historical Dirac tip and takes
+     * bit-for-bit the original arithmetic.
+     */
+    public double[] leafKernel(double[] y, double[][] sigma, double t, double[][] sigmaEps) {
+        return leafKernel(y, sigma, t, 0.0, null, sigmaEps);
+    }
+
 
     /** Grid angle along axis ax for flat index idx (x_j = 2*pi*j/nGrid, the FFT grid). */
     private double angleOf(int idx, int ax) {
@@ -288,18 +302,31 @@ public class TorusFourierKernel {
     /**
      * Add the zero-jump term, summed analytically over winding images.
      *
-     * A tip is a point observation, so its Fourier coefficients have unit modulus at
-     * every mode and only its own terminal branch damps them. When t*Sigma is small the
-     * series needs |m| ~ 6/sqrt(sigma^2 t) modes, far past the grid; truncating it rings,
-     * and clipping the negative lobes leaves a floor that fattens the tails so distant
-     * tips score as compatible. The image sum is the same function (Poisson summation)
-     * and converges in the opposite regime -- typically one term here.
+     * A tip observed with wrapped-Gaussian error Sigma_eps has Fourier coefficients
+     * exp(-i m.y) * exp(-1/2 m' Sigma_eps m): the unit-modulus phase of a point
+     * observation, damped by a real Gaussian factor. Only its own terminal branch damps
+     * it further. Sigma_eps == null recovers the Dirac tip (unit modulus at every mode),
+     * which is what this kernel assumed before tip error existed.
+     *
+     * The zero-jump atom is therefore the wrapped normal of covariance
+     * (Sigma_eps + t*Sigma). When that covariance is small the Fourier series needs
+     * |m| ~ 6/sqrt(lambda_min) modes, far past the grid; truncating it rings, and
+     * clipping the negative lobes leaves a floor that fattens the tails so distant tips
+     * score as compatible. The image sum is the same function (Poisson summation) and
+     * converges in the opposite regime -- typically one term here. A non-zero Sigma_eps
+     * puts a floor under that covariance, so the atom stays well resolved however short
+     * the terminal branch is.
      */
     private void addLatticeAtom(double[] out, double[] y, double[][] sigma, double t,
-                                double logWeight) {
+                                double logWeight, double[][] sigmaEps) {
         final double[][] cov = new double[dim][dim];
         for (int i = 0; i < dim; i++) {
             for (int j = 0; j < dim; j++) cov[i][j] = t * sigma[i][j];
+        }
+        if (sigmaEps != null) {                      // tip error broadens the atom: Sigma_eps + t*Sigma
+            for (int i = 0; i < dim; i++) {
+                for (int j = 0; j < dim; j++) cov[i][j] += sigmaEps[i][j];
+            }
         }
         final double[][] inv = new double[dim][dim];
         final double logDet = symmetricInverse(cov, inv);
@@ -399,15 +426,41 @@ public class TorusFourierKernel {
      * is summed over winding images and D -- which carries phi(m)^n with n >= 1 and so
      * inherits the (broad) jump covariances -- stays on the FFT. multIm may be null for
      * a real multiplier.
+     *
+     * TIP OBSERVATION ERROR. A tip observed with wrapped-Gaussian error Sigma_eps has
+     * leaf coefficients
+     *     exp(-i m.y) * exp(-1/2 m' Sigma_eps m) * a_t(m),   a_t(m) = e^{t psi(m)}.
+     * The split is taken on the UNDAMPED multiplier a_t, and the real damping factor
+     * exp(-1/2 m' Sigma_eps m) then multiplies BOTH halves: the atom absorbs it exactly,
+     * as covariance (Sigma_eps + t*Sigma) in real space, and the spectral remainder D(m)
+     * carries it as a per-mode real factor. Folding Sigma_eps into the SUBTRACTED
+     * Gaussian instead would leave multRe - e^{-lam t} e^{-1/2 m'(t Sigma + Sigma_eps) m},
+     * which is not D(m) times anything; the analytic and spectral halves would then
+     * disagree with no symptom but a wrong number. sigmaEps == null skips the damping
+     * entirely, so the Dirac-tip path is unchanged to the last bit.
+     *
+     * PARTIAL OBSERVATION. Sigma_eps and missing coordinates are NOT orthogonal, and the
+     * composition is forced by what "missing" means here. The error model is
+     * y = x + eps with eps ~ N(0, Sigma_eps) on all dim axes; an unobserved axis is one
+     * whose y-component was never recorded, so the tip's contribution is the MARGINAL
+     * of that joint over the observed axes. The marginal of a Gaussian on a sub-vector is
+     * the principal SUBMATRIX of its covariance, so Sigma_eps is projected exactly as
+     * sigma and the jump covariances already are -- projectMatrix, not a precision
+     * submatrix (that would be the conditional) and not a diagonal read-off (that would
+     * drop error correlation between two observed axes). Concretely: a tip with phi
+     * observed and psi missing carries observation error Sigma_eps[phi][phi] only, and a
+     * fully missing tip carries none because it contributes no message at all.
      */
     private double[] leafKernelSplit(double[] y, double[][] sigma, double t,
-                                     double jumpRate, double[] multRe, double[] multIm) {
+                                     double jumpRate, double[] multRe, double[] multIm,
+                                     double[][] sigmaEps) {
         final int[] axes = observedAxes(y);
         if (axes.length == 0) return neutralLeaf();
         if (axes.length < dim) {
             TorusFourierKernel reduced = new TorusFourierKernel(axes.length, nGrid);
             double[] marginal = reduced.leafKernelSplit(projectPoint(y, axes), projectMatrix(sigma, axes),
-                    t, jumpRate, projectModes(multRe, reduced, axes), projectModes(multIm, reduced, axes));
+                    t, jumpRate, projectModes(multRe, reduced, axes), projectModes(multIm, reduced, axes),
+                    sigmaEps == null ? null : projectMatrix(sigmaEps, axes));
             return broadcastLeaf(marginal, axes);
         }
         final double lamT = jumpRate * t;
@@ -422,15 +475,21 @@ public class TorusFourierKernel {
             double phase = 0.0;
             for (int ax = 0; ax < dim; ax++) phase += m[ax] * y[ax];
             final double cp = Math.cos(phase), sp = Math.sin(phase);
-            final double dRe = multRe[idx] - weight * bm[idx];
-            final double dIm = (multIm == null) ? 0.0 : multIm[idx];
+            double dRe = multRe[idx] - weight * bm[idx];
+            double dIm = (multIm == null) ? 0.0 : multIm[idx];
+            if (sigmaEps != null) {
+                final double damp = Math.exp(-0.5 * quadForm(sigmaEps, m));
+                dRe *= damp;
+                dIm *= damp;
+            }
             re[idx] = scale * (dRe * cp + dIm * sp);
             im[idx] = scale * (dIm * cp - dRe * sp);
         }
         fftN(re, im, true);
         // D is a Poisson mixture of densities, hence non-negative; negatives are truncation.
+        // Convolving with the tip-error Gaussian preserves non-negativity, so this still holds.
         for (int k = 0; k < nTotal; k++) if (re[k] < 0.0) re[k] = 0.0;
-        addLatticeAtom(re, y, sigma, t, -lamT);
+        addLatticeAtom(re, y, sigma, t, -lamT, sigmaEps);
         for (int k = 0; k < nTotal; k++) if (re[k] < MIN_POS) re[k] = MIN_POS;
         return re;
     }
@@ -438,9 +497,16 @@ public class TorusFourierKernel {
     /** Leaf heat kernel under Brownian motion + compound-Poisson jumps. */
     public double[] leafKernel(double[] y, double[][] sigma, double t,
                                double jumpRate, double[][] sigmaJump) {
+        return leafKernel(y, sigma, t, jumpRate, sigmaJump, null);
+    }
+
+    /** Leaf heat kernel under BM + compound-Poisson jumps, tip observed with error sigmaEps
+     *  (covariance, radians^2; null = Dirac tip). */
+    public double[] leafKernel(double[] y, double[][] sigma, double t,
+                               double jumpRate, double[][] sigmaJump, double[][] sigmaEps) {
         if (observedAxes(y).length == 0) return neutralLeaf();
         return leafKernelSplit(y, sigma, t, jumpRate,
-                               transferMultiplier(sigma, t, jumpRate, sigmaJump), null);
+                               transferMultiplier(sigma, t, jumpRate, sigmaJump), null, sigmaEps);
     }
 
     /**
@@ -501,11 +567,18 @@ public class TorusFourierKernel {
     /** Leaf heat kernel under BM + a directed jump mixture (complex multiplier). */
     public double[] leafKernel(double[] y, double[][] sigma, double t, double jumpRate,
                                double[] w, double[][] d, double[][][] s) {
+        return leafKernel(y, sigma, t, jumpRate, w, d, s, null);
+    }
+
+    /** Leaf heat kernel under BM + a directed jump mixture, tip observed with error sigmaEps
+     *  (covariance, radians^2; null = Dirac tip). */
+    public double[] leafKernel(double[] y, double[][] sigma, double t, double jumpRate,
+                               double[] w, double[][] d, double[][][] s, double[][] sigmaEps) {
         if (observedAxes(y).length == 0) return neutralLeaf();
         final double[] mRe = new double[nTotal];
         final double[] mIm = new double[nTotal];
         transferMultiplierComplex(sigma, t, jumpRate, w, d, s, mRe, mIm);
-        return leafKernelSplit(y, sigma, t, jumpRate, mRe, mIm);
+        return leafKernelSplit(y, sigma, t, jumpRate, mRe, mIm, sigmaEps);
     }
 
     // ---- psi-cached fast path: the Levy-Khintchine exponent psi(m) is branch-length-independent,
@@ -576,13 +649,21 @@ public class TorusFourierKernel {
     /** leafKernel() using a precomputed psi (see computePsiComplex). */
     public double[] leafKernelFromPsi(double[] y, double t, double[] psiRe, double[] psiIm,
                                       double[][] sigma, double jumpRate) {
+        return leafKernelFromPsi(y, t, psiRe, psiIm, sigma, jumpRate, null);
+    }
+
+    /** leafKernelFromPsi() for a tip observed with error sigmaEps (covariance, radians^2;
+     *  null = Dirac tip). Sigma_eps damps the leaf coefficients and is branch-independent,
+     *  so it does NOT belong in psi: psi is exponentiated by t, the tip factor is not. */
+    public double[] leafKernelFromPsi(double[] y, double t, double[] psiRe, double[] psiIm,
+                                      double[][] sigma, double jumpRate, double[][] sigmaEps) {
         if (observedAxes(y).length == 0) return neutralLeaf();
         // sigma and jumpRate are required: the zero-jump term e^{-lam t} W_{t Sigma} is
         // evaluated analytically and cannot be recovered from psi alone.
         final double[] mRe = new double[nTotal];
         final double[] mIm = new double[nTotal];
         multiplierFromPsi(t, psiRe, psiIm, mRe, mIm);
-        return leafKernelSplit(y, sigma, t, jumpRate, mRe, mIm);
+        return leafKernelSplit(y, sigma, t, jumpRate, mRe, mIm, sigmaEps);
     }
 
     // ---- analytic directional derivatives for the production FFT likelihood ----
@@ -599,25 +680,65 @@ public class TorusFourierKernel {
         private final boolean hasLaw;
         private final double[] psiRe, psiIm, phiRe, phiIm;
         private final double[][] brownianGradient, psiGradientRe, psiGradientIm;
+        // Tip observation error. sigmaEps is the leaf covariance (null = Dirac tip);
+        // epsDirections[p] is d(Sigma_eps)/d(parameter p) (null = no parameter moves it).
+        // damping[m] = exp(-1/2 m' Sigma_eps m) and epsQuad[p][m] = m' epsDirections[p] m
+        // are precomputed here because they are branch-independent, exactly like psi.
+        // Both stay null when neither is supplied, which is what keeps the Dirac-tip
+        // gradient arithmetic bit-for-bit what it was.
+        private final double[][] sigmaEps;
+        private final double[][][] epsDirections;
+        private final double[] damping;
+        private final double[][] epsQuad;
 
         private GradientContext(TorusFourierKernel owner, double[][] sigma,
                                 double[][][] sigmaDirections, double[] rateDirections,
                                 double rate, boolean hasLaw) {
+            this(owner, sigma, sigmaDirections, rateDirections, rate, hasLaw, null, null);
+        }
+
+        private GradientContext(TorusFourierKernel owner, double[][] sigma,
+                                double[][][] sigmaDirections, double[] rateDirections,
+                                double rate, boolean hasLaw,
+                                double[][] sigmaEps, double[][][] epsDirections) {
             this.owner = owner;
             this.sigma = sigma;
             this.sigmaDirections = sigmaDirections;
             this.rateDirections = rateDirections;
             this.rate = rate;
             this.hasLaw = hasLaw;
+            this.sigmaEps = sigmaEps;
+            this.epsDirections = epsDirections;
             int size = owner.nTotal, parameters = rateDirections.length;
             psiRe = new double[size]; psiIm = new double[size];
             phiRe = new double[size]; phiIm = new double[size];
             brownianGradient = new double[parameters][size];
             psiGradientRe = new double[parameters][size];
             psiGradientIm = new double[parameters][size];
+            if (sigmaEps == null && epsDirections == null) {
+                damping = null;
+                epsQuad = null;
+            } else {
+                damping = new double[size];
+                epsQuad = epsDirections == null ? null : new double[parameters][size];
+                final double[] m = new double[owner.dim];
+                for (int idx = 0; idx < size; idx++) {
+                    owner.modeOf(idx, m);
+                    damping[idx] = sigmaEps == null ? 1.0
+                            : Math.exp(-0.5 * owner.quadForm(sigmaEps, m));
+                    if (epsDirections != null) {
+                        for (int p = 0; p < parameters; p++) {
+                            epsQuad[p][idx] = owner.quadForm(epsDirections[p], m);
+                        }
+                    }
+                }
+            }
         }
 
         public int getParameterCount() { return rateDirections.length; }
+
+        /** True when a tip observation error is present or differentiated. */
+        public boolean hasTipError() { return damping != null; }
     }
 
     /** Unscaled values and directional derivatives, gradients[parameter][grid cell]. */
@@ -653,6 +774,24 @@ public class TorusFourierKernel {
     public GradientContext prepareGradientContext(double[][] sigma, double jumpRate,
                                                   double[] w, double[][] d, double[][][] s,
                                                   double[][][] dSigma, double[] dRate) {
+        return prepareGradientContext(sigma, jumpRate, w, d, s, dSigma, dRate, null, null);
+    }
+
+    /**
+     * prepareGradientContext() for a tip observed with wrapped-Gaussian error.
+     *
+     * sigmaEps is the tip observation-error covariance (radians^2, null = Dirac tip);
+     * dSigmaEps[p] is its derivative with respect to parameter p (null = no parameter
+     * touches it). Sigma_eps is branch-independent, so -- like psi -- its per-mode damping
+     * exp(-1/2 m' Sigma_eps m) is computed once here and reused on every terminal branch.
+     * It does NOT go into psi: psi is exponentiated by t, the tip factor is not.
+     *
+     * Both null reproduces the Dirac-tip context and gradient exactly.
+     */
+    public GradientContext prepareGradientContext(double[][] sigma, double jumpRate,
+                                                  double[] w, double[][] d, double[][][] s,
+                                                  double[][][] dSigma, double[] dRate,
+                                                  double[][] sigmaEps, double[][][] dSigmaEps) {
         if (dSigma == null || dRate == null || dSigma.length != dRate.length)
             throw new IllegalArgumentException("Covariance and rate directions must have equal length");
         if (!Double.isFinite(jumpRate) || jumpRate < 0.0)
@@ -678,8 +817,18 @@ public class TorusFourierKernel {
                     throw new IllegalArgumentException("Jump means must be finite");
             }
         }
+        double[][] eps = null;
+        double[][][] epsDirections = null;
+        if (sigmaEps != null) eps = copyGradientMatrix(sigmaEps, "Sigma_eps");
+        if (dSigmaEps != null) {
+            if (dSigmaEps.length != dRate.length)
+                throw new IllegalArgumentException("Tip-error directions must match the parameter count");
+            epsDirections = new double[dRate.length][][];
+            for (int p = 0; p < dRate.length; p++)
+                epsDirections[p] = copyGradientMatrix(dSigmaEps[p], "Tip-error direction");
+        }
         final GradientContext context = new GradientContext(this, cov, directions,
-                rateDirections, hasLaw ? jumpRate : 0.0, hasLaw);
+                rateDirections, hasLaw ? jumpRate : 0.0, hasLaw, eps, epsDirections);
         final double[] m = new double[dim];
         for (int idx = 0; idx < nTotal; idx++) {
             modeOf(idx, m);
@@ -784,8 +933,22 @@ public class TorusFourierKernel {
             TorusFourierKernel reduced = new TorusFourierKernel(axes.length, nGrid);
             double[][][] directions = new double[parameters][][];
             for (int p = 0; p < parameters; p++) directions[p] = projectMatrix(context.sigmaDirections[p], axes);
+            // Sigma_eps marginalises with the tip, exactly as sigma does: the observed
+            // sub-vector of y = x + eps has error covariance Sigma_eps[axes][axes]. Its
+            // DERIVATIVE directions project the same way (differentiation commutes with
+            // taking a submatrix), so a tip with psi missing contributes d/dSigma_eps only
+            // through its phi block.
+            double[][] marginalEps = context.sigmaEps == null ? null
+                    : projectMatrix(context.sigmaEps, axes);
+            double[][][] marginalEpsDirections = null;
+            if (context.epsDirections != null) {
+                marginalEpsDirections = new double[parameters][][];
+                for (int p = 0; p < parameters; p++)
+                    marginalEpsDirections[p] = projectMatrix(context.epsDirections[p], axes);
+            }
             GradientContext marginal = new GradientContext(reduced, projectMatrix(context.sigma, axes),
-                    directions, context.rateDirections.clone(), context.rate, context.hasLaw);
+                    directions, context.rateDirections.clone(), context.rate, context.hasLaw,
+                    marginalEps, marginalEpsDirections);
             for (int index = 0; index < reduced.nTotal; index++) {
                 int full = embeddedIndex(index, reduced, axes);
                 marginal.psiRe[index] = context.psiRe[full];
@@ -815,24 +978,46 @@ public class TorusFourierKernel {
             rateDirection = p;
             break;
         }
+        // Scratch for the per-mode remainder derivative. With no tip error these hold the
+        // same values the old in-line locals held, so the writes below are bit-identical.
+        final double[] gradR = new double[parameters], gradI = new double[parameters];
         for (int idx = 0; idx < nTotal; idx++) {
             modeOf(idx, m);
             double phase = 0.0;
             for (int ax = 0; ax < dim; ax++) phase += m[ax] * y[ax];
             final double cp = Math.cos(phase), sp = Math.sin(phase);
-            final double dr = mRe[idx] - weight * bm[idx], di = mIm[idx];
-            re[idx] = scale * (dr * cp + di * sp);
-            im[idx] = scale * (di * cp - dr * sp);
+            double dr = mRe[idx] - weight * bm[idx], di = mIm[idx];
             for (int p = 0; p < parameters; p++) {
                 // dD/dSigma = t*dpsi_B*D; dD/dlambda = t*(phi*A-D).
                 // This form retains the nonzero right derivative at lambda=0.
                 double br = context.brownianGradient[p][idx], lr = context.rateDirections[p];
-                double gr = t * (br * dr + lr * (context.phiRe[idx] * mRe[idx]
+                gradR[p] = t * (br * dr + lr * (context.phiRe[idx] * mRe[idx]
                         - context.phiIm[idx] * mIm[idx] - dr));
-                double gi = t * (br * di + lr * (context.phiRe[idx] * mIm[idx]
+                gradI[p] = t * (br * di + lr * (context.phiRe[idx] * mIm[idx]
                         + context.phiIm[idx] * mRe[idx] - di));
-                gradientRe[p][idx] = scale * (gr * cp + gi * sp);
-                gradientIm[p][idx] = scale * (gi * cp - gr * sp);
+            }
+            if (context.damping != null) {
+                // Dtilde(m) = damp(m) * D(m). damp is CONSTANT in Sigma and in lambda, so it
+                // is a plain multiplier on their derivatives; it is not constant in Sigma_eps,
+                // and d(damp)/dE = -1/2 (m' E m) damp gives the extra term.
+                final double damp = context.damping[idx];
+                for (int p = 0; p < parameters; p++) {
+                    if (context.epsQuad != null) {
+                        final double half = 0.5 * context.epsQuad[p][idx];
+                        gradR[p] -= half * dr;
+                        gradI[p] -= half * di;
+                    }
+                    gradR[p] *= damp;
+                    gradI[p] *= damp;
+                }
+                dr *= damp;
+                di *= damp;
+            }
+            re[idx] = scale * (dr * cp + di * sp);
+            im[idx] = scale * (di * cp - dr * sp);
+            for (int p = 0; p < parameters; p++) {
+                gradientRe[p][idx] = scale * (gradR[p] * cp + gradI[p] * sp);
+                gradientIm[p][idx] = scale * (gradI[p] * cp - gradR[p] * sp);
             }
         }
         fftN(re, im, true);
@@ -853,8 +1038,16 @@ public class TorusFourierKernel {
     private void addLatticeAtomWithGradient(double[] out, double[][] gradients,
                                             double[] y, double t, GradientContext context) {
         final int parameters = context.getParameterCount();
+        // THE ATOM'S COVARIANCE IS (Sigma_eps + t*Sigma), NOT t*Sigma. This is the half of
+        // the tip-error change that genuinely alters the derivative: inv and logDet below are
+        // those of the broadened covariance, so every score term built from them changes even
+        // though the direction dC/dSigma is still t*Sigma'.
         final double[][] cov = new double[dim][dim];
         for (int i = 0; i < dim; i++) for (int j = 0; j < dim; j++) cov[i][j] = t * context.sigma[i][j];
+        if (context.sigmaEps != null) {
+            for (int i = 0; i < dim; i++)
+                for (int j = 0; j < dim; j++) cov[i][j] += context.sigmaEps[i][j];
+        }
         final double[][] inv = new double[dim][dim];
         final double logDet = symmetricInverse(cov, inv);
         double bound = 0.0;
@@ -872,9 +1065,16 @@ public class TorusFourierKernel {
             combos *= span;
         }
         final double logNorm = -context.rate * t - 0.5 * (dim * Math.log(TWO_PI) + logDet);
+        // trace[p] = tr(C^{-1} dC/dtheta_p) with dC/dtheta_p = t*Sigma'_p + E_p. The two
+        // pieces are accumulated separately so that, with no tip-error direction, this is
+        // character-for-character the expression it replaces.
         final double[] trace = new double[parameters];
         for (int p = 0; p < parameters; p++) for (int i = 0; i < dim; i++)
             for (int j = 0; j < dim; j++) trace[p] += t * inv[i][j] * context.sigmaDirections[p][j][i];
+        if (context.epsDirections != null) {
+            for (int p = 0; p < parameters; p++) for (int i = 0; i < dim; i++)
+                for (int j = 0; j < dim; j++) trace[p] += inv[i][j] * context.epsDirections[p][j][i];
+        }
         final double[] delta = new double[dim], solved = new double[dim], q = new double[combos];
         final double[][] score = new double[parameters][combos];
         for (int idx = 0; idx < nTotal; idx++) {
@@ -899,6 +1099,12 @@ public class TorusFourierKernel {
                 for (int p = 0; p < parameters; p++)
                     score[p][c] = 0.5 * (t * quadForm(context.sigmaDirections[p], solved) - trace[p])
                             - t * context.rateDirections[p];
+                // d/dtheta of -1/2 delta' C^{-1} delta contributes +1/2 (C^{-1}delta)' dC (C^{-1}delta).
+                // dC/dSigma carries the factor t; dC/dSigma_eps does NOT.
+                if (context.epsDirections != null) {
+                    for (int p = 0; p < parameters; p++)
+                        score[p][c] += 0.5 * quadForm(context.epsDirections[p], solved);
+                }
             }
             double acc = 0.0;
             final double[] derivative = new double[parameters];
@@ -920,6 +1126,38 @@ public class TorusFourierKernel {
 
     public int getGridSize() {
         return nGrid;
+    }
+
+    /**
+     * Smallest power-of-two grid that resolves a wrapped normal of covariance cov:
+     * n >= 2*pi*SHARPNESS_MARGIN / sqrt(lambda_min(cov)). With a Dirac tip the sharpest
+     * object in the tree is the shortest terminal branch (t_min*Sigma), so the requirement
+     * is unbounded as t_min -> 0. With tip error the sharpest object anywhere is Sigma_eps
+     * itself -- pruning messages only broaden going up -- so the requirement is bounded and
+     * tree-independent. Diagnostic only; nothing in the kernel calls it.
+     */
+    public static int requiredGrid(double[][] cov) {
+        final int d = cov.length;
+        double lamMin;
+        if (d == 1) {
+            lamMin = cov[0][0];
+        } else if (d == 2) {
+            final double tr = cov[0][0] + cov[1][1];
+            final double det = cov[0][0] * cov[1][1] - cov[0][1] * cov[1][0];
+            lamMin = 0.5 * tr - Math.sqrt(Math.max(0.25 * tr * tr - det, 0.0));
+        } else {
+            lamMin = Double.POSITIVE_INFINITY;   // Gershgorin lower bound (conservative)
+            for (int i = 0; i < d; i++) {
+                double off = 0.0;
+                for (int j = 0; j < d; j++) if (j != i) off += Math.abs(cov[i][j]);
+                lamMin = Math.min(lamMin, cov[i][i] - off);
+            }
+        }
+        if (!(lamMin > 0.0)) return Integer.MAX_VALUE;   // a delta needs an unbounded grid
+        final double need = TWO_PI * SHARPNESS_MARGIN / Math.sqrt(lamMin);
+        int n = 4;
+        while (n < need && n < (1 << 20)) n <<= 1;
+        return n;
     }
 
     /** Real-space transition kernel K_t(delta) on the grid = inverse FFT of the branch multiplier

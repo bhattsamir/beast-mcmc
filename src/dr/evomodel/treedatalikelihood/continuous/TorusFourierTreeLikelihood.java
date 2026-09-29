@@ -17,11 +17,14 @@ import dr.xml.Reportable;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.logging.Logger;
 
 /**
  * Felsenstein pruning likelihood for independent d-dimensional wrapped-Brownian
  * jump-diffusions (one per residue) on a flat torus. Production uses FFT propagation
- * and split wrapped-normal tips. Positive log-space validation is opt-in; analytic
+ * and split wrapped-normal tips. Tips may carry a wrapped-Gaussian observation error
+ * Sigma_eps (see {@code sigmaEpsilon}); with Sigma_eps absent or zero they are Dirac
+ * point observations, as before. Positive log-space validation is opt-in; analytic
  * HMC gradients target the production FFT calculation only.
  *
  * <p>Partial likelihoods are cached per node and per residue, following BEAST's
@@ -53,6 +56,13 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     // from the Ramachandran-basin fit. Nullable; jumpRate <= 0 or jumpS == null gives pure BM.
     // d_k != 0 makes the per-mode multiplier complex (handled by the kernel's complex path).
     private final Parameter jumpRate;
+    // Tip observation error. Each tip is a wrapped Gaussian of covariance Sigma_eps rather
+    // than a Dirac delta, so its Fourier coefficients are the unit-modulus point-observation
+    // phase damped by exp(-1/2 m' Sigma_eps m). Nullable; null, or a parameter sitting at
+    // exactly zero, is the Dirac tip and reproduces the pre-tip-error engine bit for bit.
+    // Shapes: dim x dim MatrixParameter (full), dimension-dim Parameter (per-axis variances),
+    // dimension-1 Parameter (isotropic). Units are VARIANCES in radians^2.
+    private final Parameter sigmaEpsilon;
     private final double[] jumpW;      // mixture weights, length K
     private final double[][] jumpD;    // displacements, K x dim
     private final double[][][] jumpS;  // covariances, K x dim x dim
@@ -144,7 +154,18 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
                                       TorusFourierKernel kernel,
                                       Parameter jumpRate, double[] jumpW, double[][] jumpD,
                                       double[][][] jumpS) {
+        this(name, tree, branchRateModel, precisions, tipData, kernel,
+                jumpRate, jumpW, jumpD, jumpS, null);
+    }
+
+    /** As above, with a tip observation-error covariance parameter (null = Dirac tips). */
+    public TorusFourierTreeLikelihood(String name, Tree tree, BranchRateModel branchRateModel,
+                                      List<MatrixParameter> precisions, double[][][] tipData,
+                                      TorusFourierKernel kernel,
+                                      Parameter jumpRate, double[] jumpW, double[][] jumpD,
+                                      double[][][] jumpS, Parameter sigmaEpsilon) {
         super(name);
+        this.sigmaEpsilon = sigmaEpsilon;
         this.tree = tree;
         this.branchRateModel = branchRateModel;
         this.precisions = precisions;
@@ -215,6 +236,122 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         // per-residue (dim = nResidues, one lambda each -> a move dirties only that residue) or
         // shared (dim 1 -> dirties all). See handleVariableChangedEvent.
         if (jumpRate != null) addVariable(jumpRate);
+        // Sigma_eps is shared by every residue, so a change to it dirties all of them
+        // (handleVariableChangedEvent's catch-all branch).
+        if (sigmaEpsilon != null) {
+            final int sd = sigmaEpsilon.getDimension();
+            if (sigmaEpsilon instanceof MatrixParameter) {
+                final MatrixParameter mp = (MatrixParameter) sigmaEpsilon;
+                if (mp.getRowDimension() != dim || mp.getColumnDimension() != dim) {
+                    throw new IllegalArgumentException("sigmaEpsilon matrix must be " + dim + "x" + dim);
+                }
+            } else if (sd != 1 && sd != dim) {
+                throw new IllegalArgumentException("sigmaEpsilon must have dimension 1 (isotropic) or "
+                        + dim + " (per-axis variances), got " + sd);
+            }
+            sigmaEpsilonMatrix();      // fail at construction, not mid-chain, on a bad Sigma_eps
+            addVariable(sigmaEpsilon);
+        }
+        logSigmaEpsilon(name);
+    }
+
+    /**
+     * State the effective tip observation error ONCE, at construction, for every instance --
+     * including the Sigma_eps-free one.
+     *
+     * A misspelled XML attribute is not the only way to lose Sigma_eps, and until this line
+     * existed NOTHING in a run's output recorded whether tip error was applied: a Dirac run and
+     * a Sigma_eps run produced output that was identical except for the likelihood values
+     * themselves. A 51-hour array could come back silently Dirac with plausible numbers.
+     * Grep the run log for SIGMA_EPS to settle it.
+     */
+    private void logSigmaEpsilon(String name) {
+        final Logger logger = Logger.getLogger("dr.evomodel");
+        final double[][] s = sigmaEpsilonMatrix();
+        final StringBuilder sb = new StringBuilder();
+        sb.append("TorusFourierTreeLikelihood '").append(name).append("': SIGMA_EPS ");
+        if (s == null) {
+            sb.append("= NONE (Dirac point tips)");
+            if (sigmaEpsilon != null) {
+                sb.append(" -- a sigmaEpsilon parameter IS attached but its value is exactly zero");
+            }
+        } else {
+            sb.append("APPLIED, tip observation-error covariance in rad^2 = [");
+            for (int i = 0; i < dim; i++) {
+                sb.append(i == 0 ? "" : "; ");
+                for (int j = 0; j < dim; j++) sb.append(j == 0 ? "" : " ").append(s[i][j]);
+            }
+            sb.append("]  (per-axis sd in degrees:");
+            for (int i = 0; i < dim; i++) {
+                sb.append(String.format(" %.4f", Math.toDegrees(Math.sqrt(s[i][i]))));
+            }
+            sb.append(")");
+        }
+        logger.info(sb.toString());
+    }
+
+    /**
+     * Tip observation-error covariance at the current parameter values, or null when it is
+     * exactly zero. Returning null rather than a zero matrix is deliberate: the kernel's null
+     * path is literally the original Dirac-tip arithmetic, so a model without tip error -- or
+     * with the parameter sitting at zero -- reproduces the pre-tip-error engine bit for bit.
+     */
+    private double[][] sigmaEpsilonMatrix() {
+        if (sigmaEpsilon == null) return null;
+        final double[][] s = new double[dim][dim];
+        boolean nonZero = false;
+        if (sigmaEpsilon instanceof MatrixParameter) {
+            final MatrixParameter mp = (MatrixParameter) sigmaEpsilon;
+            for (int i = 0; i < dim; i++) {
+                for (int j = 0; j < dim; j++) {
+                    s[i][j] = mp.getParameterValue(i, j);
+                    if (s[i][j] != 0.0) nonZero = true;
+                }
+            }
+        } else {
+            final boolean isotropic = sigmaEpsilon.getDimension() == 1;
+            for (int i = 0; i < dim; i++) {
+                s[i][i] = sigmaEpsilon.getParameterValue(isotropic ? 0 : i);
+                if (s[i][i] != 0.0) nonZero = true;
+            }
+        }
+        if (!nonZero) return null;
+        checkCovariance(s);
+        return s;
+    }
+
+    /**
+     * A tip-error covariance must be symmetric positive definite. The leaf damping factor is
+     * exp(-1/2 m' Sigma_eps m), which GROWS without bound in any direction where that quadratic
+     * form is negative; nothing downstream would fail, the likelihood would just be wrong. So
+     * check here and throw.
+     */
+    private static void checkCovariance(double[][] s) {
+        final int n = s.length;
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < i; j++) {
+                if (s[i][j] != s[j][i]) {
+                    throw new IllegalArgumentException("sigmaEpsilon must be symmetric: (" + i + "," + j
+                            + ")=" + s[i][j] + " but (" + j + "," + i + ")=" + s[j][i]);
+                }
+            }
+        }
+        final double[][] L = new double[n][n];
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j <= i; j++) {
+                double sum = s[i][j];
+                for (int k = 0; k < j; k++) sum -= L[i][k] * L[j][k];
+                if (i == j) {
+                    if (!(sum > 0.0)) {
+                        throw new IllegalArgumentException("sigmaEpsilon must be positive definite "
+                                + "(a covariance in radians^2); Cholesky failed on axis " + i);
+                    }
+                    L[i][i] = Math.sqrt(sum);
+                } else {
+                    L[i][j] = sum / L[j][j];
+                }
+            }
+        }
     }
 
     /** Current jump rate for residue r, clamped at 0. jumpRate may be per-residue (dimension =
@@ -247,7 +384,20 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     }
 
     public String getReport() {
-        return getClass().getSimpleName() + ": logL = " + getLogLikelihood();
+        final double[][] s = sigmaEpsilonMatrix();
+        final StringBuilder sb = new StringBuilder(getClass().getSimpleName());
+        sb.append(": logL = ").append(getLogLikelihood()).append(", SIGMA_EPS ");
+        if (s == null) {
+            sb.append("= NONE (Dirac point tips)");
+        } else {
+            sb.append("= [");
+            for (int i = 0; i < dim; i++) {
+                sb.append(i == 0 ? "" : "; ");
+                for (int j = 0; j < dim; j++) sb.append(j == 0 ? "" : " ").append(s[i][j]);
+            }
+            sb.append("] rad^2");
+        }
+        return sb.toString();
     }
 
     public int getResidueCount() { return nResidues; }
@@ -264,6 +414,29 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
      * sum this component across residues.
      */
     public double[] getResidueGradient(int residue) {
+        return residueGradient(residue, false);
+    }
+
+    /**
+     * As getResidueGradient(), plus a fifth component: the derivative with respect to an
+     * ISOTROPIC tip observation-error variance s (radians^2), i.e. Sigma_eps = s*I.
+     *
+     * Sigma_eps is fixed in the HA analysis, so nothing samples this; it exists so the
+     * identifiability question -- can the data tell Sigma_eps from Sigma? -- can be asked
+     * with a score rather than by re-running the chain, and so the tip-error terms in the
+     * other four components have an independent finite-difference check.
+     */
+    public double[] getResidueGradientWithTipError(int residue) {
+        if (sigmaEpsilon != null
+                && (sigmaEpsilon instanceof MatrixParameter || sigmaEpsilon.getDimension() != 1)) {
+            throw new IllegalArgumentException("d/dSigma_eps is implemented for an isotropic "
+                    + "(dimension-1) sigmaEpsilon; a per-axis or full-matrix Sigma_eps needs one "
+                    + "direction per free entry");
+        }
+        return residueGradient(residue, true);
+    }
+
+    private double[] residueGradient(int residue, boolean tipError) {
         if (validateEveryEvaluation) {
             throw new IllegalStateException("Torus HMC gradients require torus.validate=false; "
                     + "they differentiate the FFT likelihood, not adaptive reference quadrature");
@@ -287,13 +460,14 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         if (!Double.isFinite(rate) || rate < 0.0) {
             throw new ArithmeticException("Invalid jump rate in torus gradient");
         }
-        final double[][][] dPrecision = new double[4][2][2];
+        final int parameters = tipError ? 5 : 4;
+        final double[][][] dPrecision = new double[parameters][2][2];
         dPrecision[0][0][0] = 1.0;
         dPrecision[1][1][1] = 1.0;
         dPrecision[0][0][1] = dPrecision[0][1][0] = 0.5 * rho * Math.sqrt(q2 / q1);
         dPrecision[1][0][1] = dPrecision[1][1][0] = 0.5 * rho * Math.sqrt(q1 / q2);
         dPrecision[2][0][1] = dPrecision[2][1][0] = Math.sqrt(q1) * Math.sqrt(q2);
-        final double[][][] dSigma = new double[4][2][2];
+        final double[][][] dSigma = new double[parameters][2][2];
         // d(Q^-1) = -Q^-1 (dQ) Q^-1.
         for (int p = 0; p < 3; p++) {
             for (int i = 0; i < 2; i++) {
@@ -309,12 +483,22 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) {
             if (!Double.isFinite(sigma[i][j]))
                 throw new ArithmeticException("Covariance overflow in torus gradient");
-            for (int p = 0; p < 4; p++) if (!Double.isFinite(dSigma[p][i][j]))
+            for (int p = 0; p < parameters; p++) if (!Double.isFinite(dSigma[p][i][j]))
                 throw new ArithmeticException("Covariance derivative overflow in torus gradient");
+        }
+        final double[] dRate = new double[parameters];
+        dRate[3] = 1.0;
+        // Sigma_eps enters the leaf kernel only, so its direction is carried separately from
+        // dSigma: it must NOT be folded into the diffusion covariance, which every branch sees.
+        double[][][] dSigmaEps = null;
+        if (tipError) {
+            dSigmaEps = new double[parameters][2][2];
+            dSigmaEps[4][0][0] = 1.0;                 // Sigma_eps = s*I  ->  d/ds = I
+            dSigmaEps[4][1][1] = 1.0;
         }
         TorusFourierKernel.GradientContext context = kernel.prepareGradientContext(
                 sigma, rate, jumpW, jumpD, jumpS,
-                dSigma, new double[]{0.0, 0.0, 0.0, 1.0});
+                dSigma, dRate, sigmaEpsilonMatrix(), dSigmaEps);
         GradientPartial root = gradientPartial(residue, tree.getRoot(), context);
         double total = 0.0;
         for (double v : root.values) total += v;
@@ -336,19 +520,21 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     private static final class GradientPartial {
         final double[] values;
         final double[][] gradients;
-        final double[] logScaleGradient = new double[4];
+        final double[] logScaleGradient;
 
-        GradientPartial(int size) {
+        GradientPartial(int size, int parameters) {
             values = new double[size];
             Arrays.fill(values, 1.0);
-            gradients = new double[4][size];
+            gradients = new double[parameters][size];
+            logScaleGradient = new double[parameters];
         }
     }
 
     /** Forward differentiation, with the same per-child normalization as updateNodePartial. */
     private GradientPartial gradientPartial(int residue, NodeRef node,
                                             TorusFourierKernel.GradientContext context) {
-        GradientPartial partial = new GradientPartial(n2);
+        final int parameters = context.getParameterCount();
+        GradientPartial partial = new GradientPartial(n2, parameters);
         for (int c = 0; c < tree.getChildCount(node); c++) {
             NodeRef child = tree.getChild(node, c);
             TorusFourierKernel.ValueGradient message;
@@ -360,7 +546,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
                 GradientPartial childPartial = gradientPartial(residue, child, context);
                 message = kernel.propagateWithGradient(childPartial.values, childPartial.gradients,
                         branchLength(child), context);
-                for (int p = 0; p < 4; p++) {
+                for (int p = 0; p < parameters; p++) {
                     partial.logScaleGradient[p] += childPartial.logScaleGradient[p];
                 }
             }
@@ -368,7 +554,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             int peakIndex = 0;
             for (int k = 0; k < n2; k++) {
                 final double previous = partial.values[k];
-                for (int p = 0; p < 4; p++) {
+                for (int p = 0; p < parameters; p++) {
                     partial.gradients[p][k] = partial.gradients[p][k] * message.values[k]
                             + previous * message.gradients[p][k];
                 }
@@ -381,7 +567,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             if (!(max > 0.0) || !Double.isFinite(max)) {
                 throw new ArithmeticException("Torus subtree underflow or overflow in gradient evaluation");
             }
-            for (int p = 0; p < 4; p++) {
+            for (int p = 0; p < parameters; p++) {
                 double dLogScale = partial.gradients[p][peakIndex] / max;
                 partial.logScaleGradient[p] += dLogScale;
                 for (int k = 0; k < n2; k++) {
@@ -407,6 +593,8 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         // speedup while making the total deterministic (seed-reproducible).
         // Mixture components (jumpW/jumpD/jumpS) are fixed instance fields; the rate lambda may be
         // per-residue (jumpRateValue(r)), so it is read inside the per-residue loop.
+        // Sigma_eps is shared by all residues and constant across the sweep; resolve it once.
+        final double[][] sigmaEps = sigmaEpsilonMatrix();
         final double[] residueLogL = new double[nResidues];
         java.util.stream.IntStream stream = java.util.stream.IntStream.range(0, nResidues);
         if (nResidues >= PARALLEL_THRESHOLD) stream = stream.parallel();
@@ -416,7 +604,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             // The branch-independent jump exponent is needed once per residue, but only if
             // some node in this residue actually recomputes; see PsiCache.
             final PsiCache psi = new PsiCache(sigma, jr);
-            boolean changed = updateNodePartial(r, root, sigma, psi, jr);
+            boolean changed = updateNodePartial(r, root, sigma, psi, jr, sigmaEps);
             if (changed || Double.isNaN(acceptedResidueLogL[r])) {
                 final int rn = root.getNumber();
                 double fft = nodeLogScale[r][rn]
@@ -425,7 +613,8 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
                     // A smooth-looking tip or a positive FFT result does not certify
                     // the pruning tail. Validate the completed likelihood itself.
                     TorusLogSpacePruning.Result stable = TorusLogSpacePruning.calculate(
-                            tree, this::branchLength, tipData[r], sigma, jr, jumpW, jumpD, jumpS);
+                            tree, this::branchLength, tipData[r], sigma, jr, jumpW, jumpD, jumpS,
+                            sigmaEps);
                     acceptedResidueLogL[r] = Double.isFinite(fft)
                             && Math.abs(fft - stable.logLikelihood) <= TorusLogSpacePruning.LOG_TOLERANCE
                             ? fft : stable.logLikelihood;
@@ -496,7 +685,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
      * propagate the dirty path upward. Mirrors prune_loglik on a cache miss.
      */
     private boolean updateNodePartial(int r, NodeRef node, double[][] sigma, PsiCache psi,
-                                      double jumpRate) {
+                                      double jumpRate, double[][] sigmaEps) {
         final int nn = node.getNumber();
         final int childCount = tree.getChildCount(node);
 
@@ -504,7 +693,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         for (int c = 0; c < childCount; c++) {
             final NodeRef child = tree.getChild(node, c);
             if (!tree.isExternal(child)) {
-                childRecomputed |= updateNodePartial(r, child, sigma, psi, jumpRate);
+                childRecomputed |= updateNodePartial(r, child, sigma, psi, jumpRate, sigmaEps);
             } else {
                 // Tips hold no cached partial (the leaf message is rebuilt on the fly),
                 // so their own dirty flag must be consulted here: a sampled tip-date or
@@ -535,8 +724,11 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
                 if (y == null) {                          // masked: residue absent at this taxon
                     msg = flatLeaf;                       // flat -> tip value marginalised out
                 } else {
-                    msg = hasJump ? kernel.leafKernelFromPsi(y, bl, psi.re(), psi.im(), sigma, jumpRate)
-                                  : kernel.leafKernel(y, sigma, bl);
+                    // Tip observation error enters HERE and nowhere else: only terminal branches
+                    // carry it, and internal propagation is untouched.
+                    msg = hasJump
+                            ? kernel.leafKernelFromPsi(y, bl, psi.re(), psi.im(), sigma, jumpRate, sigmaEps)
+                            : kernel.leafKernel(y, sigma, bl, sigmaEps);
                 }
             } else {
                 final int cn = child.getNumber();
@@ -647,7 +839,8 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         } else if (variable == jumpRate && jumpRate.getDimension() == nResidues && index >= 0) {
             residueDirty[index] = true;  // per-residue lambda: only that residue's rate changed
         } else {
-            Arrays.fill(residueDirty, true);   // shared lambda, bulk change (index<0), or anything else
+            // shared lambda, sigmaEpsilon (shared by every residue), bulk change (index<0), or anything else
+            Arrays.fill(residueDirty, true);
         }
         likelihoodKnown = false;
         ancestorsDirty = true;
@@ -742,7 +935,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         if (stableResults[r] == null) {
             stableResults[r] = TorusLogSpacePruning.calculate(
                     tree, this::branchLength, tipData[r], invertPrecision(precisions.get(r)),
-                    jumpRateValue(r), jumpW, jumpD, jumpS);
+                    jumpRateValue(r), jumpW, jumpD, jumpS, sigmaEpsilonMatrix());
         }
         stableResults[r].sample(sampledAnc[r]);
     }
