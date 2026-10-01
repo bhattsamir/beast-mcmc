@@ -17,13 +17,16 @@ import dr.xml.Reportable;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.logging.Logger;
 
 /**
  * Felsenstein pruning likelihood for independent d-dimensional wrapped-Brownian
- * diffusions (one per residue) on a flat torus. FFT heat-kernel propagation is
- * checked against positive log-space quadrature for every changed residue;
- * the reference result replaces an inaccurate FFT likelihood. Gaussian windings
- * and jump counts are summed with explicit truncation bounds.
+ * diffusions (one per residue) on a flat torus. Tips may carry a wrapped-Gaussian
+ * observation error Sigma_eps (see {@code sigmaEpsilon}); with Sigma_eps absent or zero
+ * they are Dirac point observations for shift; landing requires positive Sigma_eps.
+ * Optional per-evaluation validation uses a positive reference for the selected law;
+ * the reference result replaces an inaccurate FFT likelihood. Ancestral logging
+ * builds that law's positive reference on demand and draws jointly from its partials.
  *
  * <p>Partial likelihoods are cached per node and per residue, following BEAST's
  * standard tree-likelihood scheme (cf. {@code AbstractTreeLikelihood} /
@@ -41,6 +44,7 @@ import java.util.List;
 public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implements Reportable, TreeTraitProvider {
 
     public static final String TORUS_FOURIER_LIKELIHOOD = "torusFourierTreeLikelihood";
+    public enum JumpLaw { SHIFT, LANDING }
     private static final double MIN_BRANCH = 1.0e-8;   // floor for zero-length branches (replicate tips)
     private static final int PARALLEL_THRESHOLD = 8;   // parallelise the residue loop at/above this many residues
 
@@ -49,11 +53,31 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     private final List<MatrixParameter> precisions;    // one dim x dim precision per residue
     private final double[][][] tipData;                // [residue][externalNodeNumber][dim], radians
     private final TorusFourierKernel kernel;
+    private final JumpLaw jumpLaw;
+    // One fixed landing distribution per likelihood, shared by its residues. Unlike
+    // psi, ghat is independent of both the sampled diffusion and the jump rate.
+    private final double[] landingGhatRe;
+    private final double[] landingGhatIm;
+    private final long[][] landingNonpositiveByBranch;
+    private final long[][] storedLandingNonpositiveByBranch;
+    // Strict tail checking is an audit option. The usual likelihood preserves the
+    // requested Fourier discretisation, including signed truncation tails, so its
+    // values agree with the standalone used to calibrate practical grid sizes.
+    private final boolean strictLandingNumerics = Boolean.getBoolean("torus.landing.strict");
+    private final java.util.concurrent.atomic.AtomicBoolean landingResolutionWarning =
+            new java.util.concurrent.atomic.AtomicBoolean();
     // Compound-Poisson jump, shared across residues: sampled rate lambda (jumpRate) and a FIXED
     // directed mixture of wrapped-normal components {weight w_k, displacement d_k, covariance S_k}
     // from the Ramachandran-basin fit. Nullable; jumpRate <= 0 or jumpS == null gives pure BM.
     // d_k != 0 makes the per-mode multiplier complex (handled by the kernel's complex path).
     private final Parameter jumpRate;
+    // Tip observation error. Each tip is a wrapped Gaussian of covariance Sigma_eps rather
+    // than a Dirac delta, so its Fourier coefficients are the unit-modulus point-observation
+    // phase damped by exp(-1/2 m' Sigma_eps m). Nullable; null, or a parameter sitting at
+    // exactly zero, is the Dirac tip and reproduces the pre-tip-error engine bit for bit.
+    // Shapes: dim x dim MatrixParameter (full), dimension-dim Parameter (per-axis variances),
+    // dimension-1 Parameter (isotropic). Units are VARIANCES in radians^2.
+    private final Parameter sigmaEpsilon;
     private final double[] jumpW;      // mixture weights, length K
     private final double[][] jumpD;    // displacements, K x dim
     private final double[][][] jumpS;  // covariances, K x dim x dim
@@ -115,6 +139,10 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
 
     private final TorusLogSpacePruning.Result[] stableResults;
     private final TorusLogSpacePruning.Result[] storedStableResults;
+    // The landing reference uses absolute reset locations and a stationary landing root.
+    // It is built only for explicit validation or requested ancestral trait logging.
+    private final TorusLandingPruning.Result[] landingStableResults;
+    private final TorusLandingPruning.Result[] storedLandingStableResults;
     private final double[] acceptedResidueLogL;
     private final double[] storedAcceptedResidueLogL;
 
@@ -142,7 +170,31 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
                                       TorusFourierKernel kernel,
                                       Parameter jumpRate, double[] jumpW, double[][] jumpD,
                                       double[][][] jumpS) {
+        this(name, tree, branchRateModel, precisions, tipData, kernel,
+                jumpRate, jumpW, jumpD, jumpS, null);
+    }
+
+    /** As above, with a tip observation-error covariance parameter (null = Dirac tips). */
+    public TorusFourierTreeLikelihood(String name, Tree tree, BranchRateModel branchRateModel,
+                                      List<MatrixParameter> precisions, double[][][] tipData,
+                                      TorusFourierKernel kernel,
+                                      Parameter jumpRate, double[] jumpW, double[][] jumpD,
+                                      double[][][] jumpS, Parameter sigmaEpsilon) {
+        this(name, tree, branchRateModel, precisions, tipData, kernel,
+                jumpRate, jumpW, jumpD, jumpS, sigmaEpsilon, JumpLaw.SHIFT);
+    }
+
+    /** Select the jump law explicitly. For LANDING, jumpD contains absolute basin
+     * means, and a strictly positive observation-error covariance is required. */
+    public TorusFourierTreeLikelihood(String name, Tree tree, BranchRateModel branchRateModel,
+                                      List<MatrixParameter> precisions, double[][][] tipData,
+                                      TorusFourierKernel kernel,
+                                      Parameter jumpRate, double[] jumpW, double[][] jumpD,
+                                      double[][][] jumpS, Parameter sigmaEpsilon, JumpLaw jumpLaw) {
         super(name);
+        if (jumpLaw == null) throw new IllegalArgumentException("jumpLaw must be shift or landing");
+        this.jumpLaw = jumpLaw;
+        this.sigmaEpsilon = sigmaEpsilon;
         this.tree = tree;
         this.branchRateModel = branchRateModel;
         this.precisions = precisions;
@@ -155,9 +207,28 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         this.nResidues = precisions.size();
         this.n2 = kernel.getGridCount();
         this.dim = kernel.getDimension();
+        if (jumpLaw == JumpLaw.LANDING) {
+            if (jumpRate == null || (jumpRate.getDimension() != 1
+                    && jumpRate.getDimension() != nResidues)) {
+                throw new IllegalArgumentException("landing requires jumpRate with dimension 1 or nResidues");
+            }
+            this.landingGhatRe = new double[n2];
+            this.landingGhatIm = new double[n2];
+            kernel.computeGhat(jumpW, jumpD, jumpS, landingGhatRe, landingGhatIm);
+            if (tree.isExternal(tree.getRoot())) {
+                throw new IllegalArgumentException("landing requires a tree with an internal root");
+            }
+        } else {
+            this.landingGhatRe = null;
+            this.landingGhatIm = null;
+        }
         this.nodeCount = tree.getNodeCount();
+        this.landingNonpositiveByBranch = jumpLaw == JumpLaw.LANDING ? new long[nResidues][nodeCount] : null;
+        this.storedLandingNonpositiveByBranch = jumpLaw == JumpLaw.LANDING ? new long[nResidues][nodeCount] : null;
         this.stableResults = new TorusLogSpacePruning.Result[nResidues];
         this.storedStableResults = new TorusLogSpacePruning.Result[nResidues];
+        this.landingStableResults = jumpLaw == JumpLaw.LANDING ? new TorusLandingPruning.Result[nResidues] : null;
+        this.storedLandingStableResults = jumpLaw == JumpLaw.LANDING ? new TorusLandingPruning.Result[nResidues] : null;
         this.acceptedResidueLogL = new double[nResidues];
         Arrays.fill(this.acceptedResidueLogL, Double.NaN);   // "not yet computed" sentinel
         this.storedAcceptedResidueLogL = new double[nResidues];
@@ -207,6 +278,154 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         // per-residue (dim = nResidues, one lambda each -> a move dirties only that residue) or
         // shared (dim 1 -> dirties all). See handleVariableChangedEvent.
         if (jumpRate != null) addVariable(jumpRate);
+        // Sigma_eps is shared by every residue, so a change to it dirties all of them
+        // (handleVariableChangedEvent's catch-all branch).
+        if (sigmaEpsilon != null) {
+            final int sd = sigmaEpsilon.getDimension();
+            if (sigmaEpsilon instanceof MatrixParameter) {
+                final MatrixParameter mp = (MatrixParameter) sigmaEpsilon;
+                if (mp.getRowDimension() != dim || mp.getColumnDimension() != dim) {
+                    throw new IllegalArgumentException("sigmaEpsilon matrix must be " + dim + "x" + dim);
+                }
+            } else if (sd != 1 && sd != dim) {
+                throw new IllegalArgumentException("sigmaEpsilon must have dimension 1 (isotropic) or "
+                        + dim + " (per-axis variances), got " + sd);
+            }
+            sigmaEpsilonMatrix();      // fail at construction, not mid-chain, on a bad Sigma_eps
+            addVariable(sigmaEpsilon);
+        }
+        if (jumpLaw == JumpLaw.LANDING) requireLandingObservationError();
+        logSigmaEpsilon(name);
+        if (jumpLaw == JumpLaw.LANDING) {
+            Logger.getLogger("dr.evomodel").info("TorusFourierTreeLikelihood '" + name
+                    + "': JUMP_LAW = landing (fixed absolute basin means, stationary landing root), nGrid="
+                    + kernel.getGridSize() + ", strict numerical audit=" + strictLandingNumerics);
+        }
+    }
+
+    public JumpLaw getJumpLaw() { return jumpLaw; }
+
+    /** Counts nonpositive spectral values, without replacing them by a positive floor. */
+    public long getLandingNonpositiveCount() { return kernel.getLandingNonpositiveCount(); }
+
+    /** Current branch audit indexed by residue and child node number (the root slot is zero).
+     * These are cells that a positivity floor would change; landing leaves them untouched. */
+    public long[][] getLandingBranchNonpositiveCounts() {
+        if (jumpLaw != JumpLaw.LANDING) return new long[0][];
+        getLogLikelihood();
+        final long[][] out = new long[nResidues][];
+        for (int r = 0; r < nResidues; r++) out[r] = landingNonpositiveByBranch[r].clone();
+        return out;
+    }
+
+    private double[][] requireLandingObservationError() {
+        final double[][] s = sigmaEpsilonMatrix();
+        if (s == null) {
+            throw new IllegalArgumentException("jumpLaw=landing requires positive-definite sigmaEpsilon");
+        }
+        for (double[] row : s) for (double value : row) {
+            if (!Double.isFinite(value)) throw new IllegalArgumentException("landing sigmaEpsilon must be finite");
+        }
+        return s;
+    }
+
+    /**
+     * State the effective tip observation error ONCE, at construction, for every instance --
+     * including the Sigma_eps-free one.
+     *
+     * A misspelled XML attribute is not the only way to lose Sigma_eps, and until this line
+     * existed NOTHING in a run's output recorded whether tip error was applied: a Dirac run and
+     * a Sigma_eps run produced output that was identical except for the likelihood values
+     * themselves. A 51-hour array could come back silently Dirac with plausible numbers.
+     * Grep the run log for SIGMA_EPS to settle it.
+     */
+    private void logSigmaEpsilon(String name) {
+        final Logger logger = Logger.getLogger("dr.evomodel");
+        final double[][] s = sigmaEpsilonMatrix();
+        final StringBuilder sb = new StringBuilder();
+        sb.append("TorusFourierTreeLikelihood '").append(name).append("': SIGMA_EPS ");
+        if (s == null) {
+            sb.append("= NONE (Dirac point tips)");
+            if (sigmaEpsilon != null) {
+                sb.append(" -- a sigmaEpsilon parameter IS attached but its value is exactly zero");
+            }
+        } else {
+            sb.append("APPLIED, tip observation-error covariance in rad^2 = [");
+            for (int i = 0; i < dim; i++) {
+                sb.append(i == 0 ? "" : "; ");
+                for (int j = 0; j < dim; j++) sb.append(j == 0 ? "" : " ").append(s[i][j]);
+            }
+            sb.append("]  (per-axis sd in degrees:");
+            for (int i = 0; i < dim; i++) {
+                sb.append(String.format(" %.4f", Math.toDegrees(Math.sqrt(s[i][i]))));
+            }
+            sb.append(")");
+        }
+        logger.info(sb.toString());
+    }
+
+    /**
+     * Tip observation-error covariance at the current parameter values, or null when it is
+     * exactly zero. Returning null rather than a zero matrix is deliberate: the kernel's null
+     * path is literally the original Dirac-tip arithmetic, so a model without tip error -- or
+     * with the parameter sitting at zero -- reproduces the pre-tip-error engine bit for bit.
+     */
+    private double[][] sigmaEpsilonMatrix() {
+        if (sigmaEpsilon == null) return null;
+        final double[][] s = new double[dim][dim];
+        boolean nonZero = false;
+        if (sigmaEpsilon instanceof MatrixParameter) {
+            final MatrixParameter mp = (MatrixParameter) sigmaEpsilon;
+            for (int i = 0; i < dim; i++) {
+                for (int j = 0; j < dim; j++) {
+                    s[i][j] = mp.getParameterValue(i, j);
+                    if (s[i][j] != 0.0) nonZero = true;
+                }
+            }
+        } else {
+            final boolean isotropic = sigmaEpsilon.getDimension() == 1;
+            for (int i = 0; i < dim; i++) {
+                s[i][i] = sigmaEpsilon.getParameterValue(isotropic ? 0 : i);
+                if (s[i][i] != 0.0) nonZero = true;
+            }
+        }
+        if (!nonZero) return null;
+        checkCovariance(s);
+        return s;
+    }
+
+    /**
+     * A tip-error covariance must be symmetric positive definite. The leaf damping factor is
+     * exp(-1/2 m' Sigma_eps m), which GROWS without bound in any direction where that quadratic
+     * form is negative; nothing downstream would fail, the likelihood would just be wrong. So
+     * check here and throw.
+     */
+    private static void checkCovariance(double[][] s) {
+        final int n = s.length;
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < i; j++) {
+                if (s[i][j] != s[j][i]) {
+                    throw new IllegalArgumentException("sigmaEpsilon must be symmetric: (" + i + "," + j
+                            + ")=" + s[i][j] + " but (" + j + "," + i + ")=" + s[j][i]);
+                }
+            }
+        }
+        final double[][] L = new double[n][n];
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j <= i; j++) {
+                double sum = s[i][j];
+                for (int k = 0; k < j; k++) sum -= L[i][k] * L[j][k];
+                if (i == j) {
+                    if (!(sum > 0.0)) {
+                        throw new IllegalArgumentException("sigmaEpsilon must be positive definite "
+                                + "(a covariance in radians^2); Cholesky failed on axis " + i);
+                    }
+                    L[i][i] = Math.sqrt(sum);
+                } else {
+                    L[i][j] = sum / L[j][j];
+                }
+            }
+        }
     }
 
     /** Current jump rate for residue r, clamped at 0. jumpRate may be per-residue (dimension =
@@ -239,10 +458,24 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     }
 
     public String getReport() {
-        return getClass().getSimpleName() + ": logL = " + getLogLikelihood();
+        final double[][] s = sigmaEpsilonMatrix();
+        final StringBuilder sb = new StringBuilder(getClass().getSimpleName());
+        sb.append(": logL = ").append(getLogLikelihood()).append(", SIGMA_EPS ");
+        if (s == null) {
+            sb.append("= NONE (Dirac point tips)");
+        } else {
+            sb.append("= [");
+            for (int i = 0; i < dim; i++) {
+                sb.append(i == 0 ? "" : "; ");
+                for (int j = 0; j < dim; j++) sb.append(j == 0 ? "" : " ").append(s[i][j]);
+            }
+            sb.append("] rad^2");
+        }
+        return sb.toString();
     }
 
     private double calculateLogLikelihood() {
+        if (jumpLaw == JumpLaw.LANDING) return calculateLandingLogLikelihood();
         final NodeRef root = tree.getRoot();
         // Residues are independent; each residue reads/writes only its own slice of
         // the partial/scale/index arrays, the dirty flags are read-only during the
@@ -255,6 +488,8 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         // speedup while making the total deterministic (seed-reproducible).
         // Mixture components (jumpW/jumpD/jumpS) are fixed instance fields; the rate lambda may be
         // per-residue (jumpRateValue(r)), so it is read inside the per-residue loop.
+        // Sigma_eps is shared by all residues and constant across the sweep; resolve it once.
+        final double[][] sigmaEps = sigmaEpsilonMatrix();
         final double[] residueLogL = new double[nResidues];
         java.util.stream.IntStream stream = java.util.stream.IntStream.range(0, nResidues);
         if (nResidues >= PARALLEL_THRESHOLD) stream = stream.parallel();
@@ -267,7 +502,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
                 psiIm = new double[n2];
                 kernel.computePsiComplex(sigma, jr, jumpW, jumpD, jumpS, psiRe, psiIm);
             }
-            boolean changed = updateNodePartial(r, root, sigma, psiRe, psiIm, jr);
+            boolean changed = updateNodePartial(r, root, sigma, psiRe, psiIm, jr, sigmaEps);
             if (changed || Double.isNaN(acceptedResidueLogL[r])) {
                 final int rn = root.getNumber();
                 double fft = nodeLogScale[r][rn]
@@ -276,7 +511,8 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
                     // A smooth-looking tip or a positive FFT result does not certify
                     // the pruning tail. Validate the completed likelihood itself.
                     TorusLogSpacePruning.Result stable = TorusLogSpacePruning.calculate(
-                            tree, this::branchLength, tipData[r], sigma, jr, jumpW, jumpD, jumpS);
+                            tree, this::branchLength, tipData[r], sigma, jr, jumpW, jumpD, jumpS,
+                            sigmaEps);
                     acceptedResidueLogL[r] = Double.isFinite(fft)
                             && Math.abs(fft - stable.logLikelihood) <= TorusLogSpacePruning.LOG_TOLERANCE
                             ? fft : stable.logLikelihood;
@@ -304,7 +540,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
      * propagate the dirty path upward. Mirrors prune_loglik on a cache miss.
      */
     private boolean updateNodePartial(int r, NodeRef node, double[][] sigma, double[] psiRe, double[] psiIm,
-                                      double jumpRate) {
+                                      double jumpRate, double[][] sigmaEps) {
         final int nn = node.getNumber();
         final int childCount = tree.getChildCount(node);
 
@@ -312,7 +548,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         for (int c = 0; c < childCount; c++) {
             final NodeRef child = tree.getChild(node, c);
             if (!tree.isExternal(child)) {
-                childRecomputed |= updateNodePartial(r, child, sigma, psiRe, psiIm, jumpRate);
+                childRecomputed |= updateNodePartial(r, child, sigma, psiRe, psiIm, jumpRate, sigmaEps);
             } else {
                 // Tips hold no cached partial (the leaf message is rebuilt on the fly),
                 // so their own dirty flag must be consulted here: a sampled tip-date or
@@ -340,8 +576,10 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
                 if (y == null) {                          // masked: residue absent at this taxon
                     msg = flatLeaf;                       // flat -> tip value marginalised out
                 } else {
-                    msg = hasJump ? kernel.leafKernelFromPsi(y, bl, psiRe, psiIm, sigma, jumpRate)
-                                  : kernel.leafKernel(y, sigma, bl);
+                    // Tip observation error enters HERE and nowhere else: only terminal branches
+                    // carry it, and internal propagation is untouched.
+                    msg = hasJump ? kernel.leafKernelFromPsi(y, bl, psiRe, psiIm, sigma, jumpRate, sigmaEps)
+                                  : kernel.leafKernel(y, sigma, bl, sigmaEps);
                 }
             } else {
                 final int cn = child.getNumber();
@@ -372,6 +610,194 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         currentIndex[r][nn] = 1 - currentIndex[r][nn];   // flip to the freshly written buffer
         nodeRecomputes.incrementAndGet();
         return true;
+    }
+
+    /** Landing has its own root, branch operator, and optional positive reference. */
+    private double calculateLandingLogLikelihood() {
+        final double[][] sigmaEps = requireLandingObservationError();
+        final NodeRef root = tree.getRoot();
+        java.util.stream.IntStream stream = java.util.stream.IntStream.range(0, nResidues);
+        if (nResidues >= PARALLEL_THRESHOLD) stream = stream.parallel();
+        stream.forEach(r -> {
+            final double[][] sigma = invertPrecision(precisions.get(r));
+            final double lambda = jumpRate.getParameterValue(jumpRate.getDimension() == 1 ? 0 : r);
+            if (!Double.isFinite(lambda) || lambda < 0.0) {
+                throw new IllegalArgumentException("landing jumpRate must be finite and nonnegative");
+            }
+            final boolean changed = updateLandingNodePartial(r, root, sigma, lambda, sigmaEps);
+            if (changed || Double.isNaN(acceptedResidueLogL[r])) {
+                final int rn = root.getNumber();
+                final double rootMass = kernel.rootIntegralLanding(
+                        partials[currentIndex[r][rn]][r][rn], sigma, lambda, landingGhatRe, landingGhatIm);
+                final double fft = rootMass > 0.0 && Double.isFinite(rootMass)
+                        ? nodeLogScale[r][rn] + Math.log(rootMass) : Double.NaN;
+                if (validateEveryEvaluation) {
+                    final TorusLandingPruning.Result reference = landingReference(r, sigma, lambda, sigmaEps);
+                    landingStableResults[r] = reference;
+                    acceptedResidueLogL[r] = Double.isFinite(fft)
+                            && Math.abs(fft - reference.logLikelihood) <= TorusLandingPruning.LOG_TOLERANCE
+                            ? fft : reference.logLikelihood;
+                } else {
+                    if (!Double.isFinite(fft)) {
+                        throw new ArithmeticException("Invalid landing root integral for residue " + r
+                                + " at nGrid=" + kernel.getGridSize() + "; check grid convergence and covariance conditioning");
+                    }
+                    acceptedResidueLogL[r] = fft;
+                    landingStableResults[r] = null;
+                }
+                stableResults[r] = null;
+            }
+        });
+        double total = 0.0;
+        for (int r = 0; r < nResidues; r++) total += acceptedResidueLogL[r];
+        Arrays.fill(updateNode, false);
+        Arrays.fill(residueDirty, false);
+        ancestorsDirty = true;
+        return total;
+    }
+
+    private boolean updateLandingNodePartial(int r, NodeRef node, double[][] sigma,
+                                              double lambda, double[][] sigmaEps) {
+        final int nn = node.getNumber();
+        boolean changed = false;
+        for (int c = 0; c < tree.getChildCount(node); c++) {
+            final NodeRef child = tree.getChild(node, c);
+            changed |= tree.isExternal(child) ? updateNode[child.getNumber()]
+                    : updateLandingNodePartial(r, child, sigma, lambda, sigmaEps);
+        }
+        if (!(changed || updateNode[nn] || residueDirty[r])) return false;
+        final double[] values = partials[1 - currentIndex[r][nn]][r][nn];
+        Arrays.fill(values, 1.0);
+        double scale = 0.0;
+        for (int c = 0; c < tree.getChildCount(node); c++) {
+            final NodeRef child = tree.getChild(node, c);
+            final int cn = child.getNumber();
+            final double[] message;
+            if (tree.isExternal(child)) {
+                final double[] theta = tipData[r][cn];
+                message = theta == null ? flatLeaf : kernel.leafKernelLanding(theta, sigmaEps,
+                        sigma, branchLength(child), lambda, landingGhatRe, landingGhatIm);
+            } else {
+                message = kernel.propagateLanding(partials[currentIndex[r][cn]][r][cn],
+                        sigma, branchLength(child), lambda, landingGhatRe, landingGhatIm);
+                scale += nodeLogScale[r][cn];
+            }
+            // Preserve spectral values exactly: flooring small or negative tails here
+            // would silently change the model. Normalize by absolute maximum, matching
+            // the standalone Fourier reference even on an under-resolved grid.
+            double max = 0.0;
+            long nonpositive = 0;
+            double messageMin = 0.0, messageMax = 0.0;
+            for (int k = 0; k < n2; k++) {
+                values[k] *= message[k];
+                max = Math.max(max, Math.abs(values[k]));
+                if (message[k] <= 0.0) nonpositive++;
+                messageMin = Math.min(messageMin, message[k]);
+                messageMax = Math.max(messageMax, Math.abs(message[k]));
+            }
+            landingNonpositiveByBranch[r][cn] = nonpositive;
+            // Negative lobes diagnose Fourier truncation. Whether the requested grid
+            // is adequate for inference is calibrated at the likelihood level, not
+            // decided solely by a pointwise tail sign. Never floor these values.
+            if (messageMin < -1e-12 * messageMax) {
+                if (strictLandingNumerics) {
+                    throw new ArithmeticException("Under-resolved landing branch for residue " + r + ", child " + cn
+                            + ", nGrid=" + kernel.getGridSize() + ": min=" + messageMin + ", maxAbs=" + messageMax
+                            + "; verify likelihood accuracy for this parameter regime");
+                }
+                if (landingResolutionWarning.compareAndSet(false, true)) {
+                    Logger.getLogger("dr.evomodel").warning("Landing likelihood at nGrid=" + kernel.getGridSize()
+                            + " has negative Fourier tail values. Values are preserved without clipping; "
+                            + "check accuracy in the intended parameter regime. "
+                            + "Use -Dtorus.landing.strict=true to reject these cases in an audit.");
+                }
+            }
+            if (!(max > 0.0) || !Double.isFinite(max)) {
+                throw new ArithmeticException("Invalid landing partial at residue " + r + ", node " + nn
+                        + ", nGrid=" + kernel.getGridSize() + "; check grid convergence and covariance conditioning");
+            }
+            for (int k = 0; k < n2; k++) values[k] /= max;
+            scale += Math.log(max);
+        }
+        nodeLogScale[r][nn] = scale;
+        currentIndex[r][nn] = 1 - currentIndex[r][nn];
+        nodeRecomputes.incrementAndGet();
+        return true;
+    }
+
+    private TorusLandingPruning.Result landingReference(int r, double[][] sigma,
+                                                         double lambda, double[][] sigmaEps) {
+        return TorusLandingPruning.calculate(tree, this::branchLength, tipData[r], sigma,
+                lambda, jumpW, jumpD, jumpS, sigmaEps, Math.min(128, kernel.getGridSize()));
+    }
+
+    /**
+     * Joint downward sample of residue r's internal angles under the landing law, reusing the
+     * FFT partials the upward pass already cached.
+     *
+     * The dense positive reference cannot serve production: on the 225-taxon HA tree at
+     * nGrid 128 it needs 6.0e10 operations per residue per logged state and its cost guard
+     * rejects that, while at the grids where it does fit its quadrature does not converge. It
+     * remains the small-tree validator; -Dtorus.landing.denseAncestral=true forces it.
+     *
+     * Root is drawn from (stationary landing law x root partial). Each internal child is then
+     * drawn from its conditional given the sampled parent CELL, which is the two-component
+     * landing mixture -- no-jump diffusion indexed by integer cell displacement, plus an
+     * absolute reset term -- weighted by that child's cached subtree partial.
+     */
+    private void sampleAncestralLanding(int r) {
+        if (Boolean.getBoolean("torus.landing.denseAncestral")) {
+            if (landingStableResults[r] == null) {
+                landingStableResults[r] = landingReference(r, invertPrecision(precisions.get(r)),
+                        jumpRate.getParameterValue(jumpRate.getDimension() == 1 ? 0 : r),
+                        requireLandingObservationError());
+            }
+            landingStableResults[r].sample(sampledAnc[r]);
+            return;
+        }
+        final double[][] sigma = invertPrecision(precisions.get(r));
+        final double lambda = jumpRate.getParameterValue(jumpRate.getDimension() == 1 ? 0 : r);
+        final NodeRef root = tree.getRoot();
+        final int rootNumber = root.getNumber();
+        java.util.Arrays.fill(sampledAnc[r], null);
+
+        final double[] stationary = kernel.landingStationaryDensity(
+                sigma, lambda, landingGhatRe, landingGhatIm);
+        final int rootCell = kernel.sampleFromProduct(
+                stationary, partials[currentIndex[r][rootNumber]][r][rootNumber],
+                dr.math.MathUtils.nextDouble());
+        if (rootCell < 0) {
+            throw new ArithmeticException("Landing ancestral sampling found no positive mass at the"
+                    + " root for residue " + r + " at nGrid=" + kernel.getGridSize()
+                    + "; the grid does not resolve this conditional");
+        }
+        sampledAnc[r][rootNumber] = kernel.anglesAt(rootCell);
+        sampleLandingChildren(r, root, rootCell, sigma, lambda);
+    }
+
+    /** Draw every internal descendant of `node`, given that `node` was sampled into `parentCell`. */
+    private void sampleLandingChildren(int r, NodeRef node, int parentCell,
+                                       double[][] sigma, double lambda) {
+        for (int c = 0; c < tree.getChildCount(node); c++) {
+            final NodeRef child = tree.getChild(node, c);
+            if (tree.isExternal(child)) continue;          // tips are observed, never sampled
+            final int cn = child.getNumber();
+            final double t = branchLength(child);
+            final double noJump = Math.exp(-lambda * t);
+            final double[] diffusion = kernel.landingDiffusionKernel(sigma, t);
+            final double[] reset = (1.0 - noJump) > 0.0
+                    ? kernel.landingResetDensity(sigma, t, lambda, landingGhatRe, landingGhatIm)
+                    : null;
+            final int cell = kernel.sampleLandingChildCell(diffusion, reset, noJump, parentCell,
+                    partials[currentIndex[r][cn]][r][cn], dr.math.MathUtils.nextDouble());
+            if (cell < 0) {
+                throw new ArithmeticException("Landing ancestral sampling found no positive mass at"
+                        + " node " + cn + " for residue " + r + " at nGrid=" + kernel.getGridSize()
+                        + "; the grid does not resolve this conditional");
+            }
+            sampledAnc[r][cn] = kernel.anglesAt(cell);
+            sampleLandingChildren(r, child, cell, sigma, lambda);
+        }
     }
 
     private double branchLength(NodeRef node) {
@@ -452,7 +878,8 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         } else if (variable == jumpRate && jumpRate.getDimension() == nResidues && index >= 0) {
             residueDirty[index] = true;  // per-residue lambda: only that residue's rate changed
         } else {
-            Arrays.fill(residueDirty, true);   // shared lambda, bulk change (index<0), or anything else
+            // shared lambda, sigmaEpsilon (shared by every residue), bulk change (index<0), or anything else
+            Arrays.fill(residueDirty, true);
         }
         likelihoodKnown = false;
         ancestorsDirty = true;
@@ -476,6 +903,12 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     private void updateAllNodes() { Arrays.fill(updateNode, true); }
 
     protected void storeState() {
+        if (jumpLaw == JumpLaw.LANDING) {
+            System.arraycopy(landingStableResults, 0, storedLandingStableResults, 0, nResidues);
+            for (int r = 0; r < nResidues; r++) {
+                System.arraycopy(landingNonpositiveByBranch[r], 0, storedLandingNonpositiveByBranch[r], 0, nodeCount);
+            }
+        }
         storedLogLikelihood = logLikelihood;
         storedLikelihoodKnown = likelihoodKnown;
         System.arraycopy(stableResults, 0, storedStableResults, 0, nResidues);
@@ -494,6 +927,12 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     }
 
     protected void restoreState() {
+        if (jumpLaw == JumpLaw.LANDING) {
+            System.arraycopy(storedLandingStableResults, 0, landingStableResults, 0, nResidues);
+            for (int r = 0; r < nResidues; r++) {
+                System.arraycopy(storedLandingNonpositiveByBranch[r], 0, landingNonpositiveByBranch[r], 0, nodeCount);
+            }
+        }
         logLikelihood = storedLogLikelihood;
         likelihoodKnown = storedLikelihoodKnown;
         System.arraycopy(storedStableResults, 0, stableResults, 0, nResidues);
@@ -538,6 +977,10 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
 
     /** Joint-sample residue r's internal-node angles into sampledAnc[r] (tips kept null). */
     private void sampleAncestral(int r) {
+        if (jumpLaw == JumpLaw.LANDING) {
+            sampleAncestralLanding(r);
+            return;
+        }
         // Always sample from the accepted positive quadrature, including directed
         // jumps. FFT tail clipping must not leak into ancestral conditionals. With
         // per-evaluation validation off, that reference is built here on demand, so its
@@ -545,11 +988,18 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         if (stableResults[r] == null) {
             stableResults[r] = TorusLogSpacePruning.calculate(
                     tree, this::branchLength, tipData[r], invertPrecision(precisions.get(r)),
-                    jumpRateValue(r), jumpW, jumpD, jumpS);
+                    jumpRateValue(r), jumpW, jumpD, jumpS, sigmaEpsilonMatrix());
         }
         stableResults[r].sample(sampledAnc[r]);
     }
 
+
+    /** Force a fresh ancestral draw from the CURRENT partials, without re-pruning.
+     *  For validation harnesses that need many draws from one posterior. */
+    public void forceAncestralResample() {
+        ancestorsDirty = true;
+        ensureAncestors();
+    }
 
     public TreeTrait[] getTreeTraits() {
         if (treeTraitArray == null) {

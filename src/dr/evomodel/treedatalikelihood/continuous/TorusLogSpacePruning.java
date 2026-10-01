@@ -100,6 +100,30 @@ public final class TorusLogSpacePruning {
     public static Result calculate(Tree tree, BranchLengths lengths, double[][] observations,
                                    double[][] sigma, double rate, double[] weights,
                                    double[][] displacements, double[][][] jumpCovariances) {
+        return calculate(tree, lengths, observations, sigma, rate, weights, displacements,
+                jumpCovariances, null);
+    }
+
+    /**
+     * As above, with a wrapped-Gaussian tip observation error of covariance sigmaEps
+     * (radians^2; null = the historical Dirac tip, taken bit-for-bit).
+     *
+     * A tip message becomes the branch transition convolved with N(0, sigmaEps), and on
+     * the torus that convolution just adds sigmaEps to the covariance of every Poisson
+     * jump-count component -- i.e. to the base covariance time*Sigma. Nothing else in the
+     * reference changes.
+     *
+     * The grid-refinement bound below uses the SAME covariance: a tip branch is bounded on
+     * time*Sigma + sigmaEps, not on time*Sigma alone. Bounding it on the Dirac assumption was
+     * safe in the sense of never being too coarse, but it made the reference demand a grid fine
+     * enough to resolve a delta function -- so -Dtorus.validate=true and ancestral-state
+     * reconstruction threw AccuracyException at exactly the sharp terminal branches that
+     * Sigma_eps exists to make tractable.
+     */
+    public static Result calculate(Tree tree, BranchLengths lengths, double[][] observations,
+                                   double[][] sigma, double rate, double[] weights,
+                                   double[][] displacements, double[][][] jumpCovariances,
+                                   double[][] sigmaEps) {
         final int dim = sigma.length;
         if (dim < 1 || dim > 3) throw new AccuracyException("reference supports dimensions 1 to 3");
         final Gaussian diffusion = new Gaussian(new double[dim], sigma);
@@ -119,13 +143,26 @@ public final class TorusLogSpacePruning {
             if (tree.isExternal(node) || !informative[node.getNumber()]) continue;
             double inverseTime = node == tree.getRoot() ? 0.0 : inverseSharpTime(
                     lengths.get(node), diffusion.precisionNorm, rate, minimumJumpVariance, dim);
+            // Tip branches only. sigmaEps enters the message at exactly one place (see prune),
+            // so it enters the bound at exactly one place too; their precisions are already in
+            // absolute units and are accumulated separately from the 1/time terms.
+            double tipPrecision = 0.0;
             for (int c = 0; c < tree.getChildCount(node); c++) {
                 NodeRef child = tree.getChild(node, c);
-                if (informative[child.getNumber()]) inverseTime += inverseSharpTime(lengths.get(child),
-                        diffusion.precisionNorm, rate, minimumJumpVariance, dim);
+                if (!informative[child.getNumber()]) continue;
+                if (sigmaEps != null && tree.isExternal(child)) {
+                    tipPrecision += sharpPrecision(lengths.get(child), sigma, sigmaEps,
+                            rate, minimumJumpVariance, dim);
+                } else {
+                    inverseTime += inverseSharpTime(lengths.get(child),
+                            diffusion.precisionNorm, rate, minimumJumpVariance, dim);
+                }
             }
-            maxConditionalPrecision = Math.max(maxConditionalPrecision,
-                    inverseTime * diffusion.precisionNorm);
+            double conditionalPrecision = inverseTime * diffusion.precisionNorm;
+            // Adding nothing must not perturb the Dirac arithmetic by even one ulp: with
+            // sigmaEps == null this is the original expression, unchanged.
+            if (tipPrecision > 0.0) conditionalPrecision += tipPrecision;
+            maxConditionalPrecision = Math.max(maxConditionalPrecision, conditionalPrecision);
         }
         final double conditionalWidth = 1.0 / Math.sqrt(maxConditionalPrecision);
         int grid = 8;
@@ -137,11 +174,11 @@ public final class TorusLogSpacePruning {
             checkCost(tree, dim, grid);
             try {
                 Result a = evaluate(tree, lengths, observations, sigma, rate, weights,
-                        displacements, jumpCovariances, grid, 0.0, informative);
+                        displacements, jumpCovariances, grid, 0.0, informative, sigmaEps);
                 Result b = evaluate(tree, lengths, observations, sigma, rate, weights,
-                        displacements, jumpCovariances, grid, 0.5, informative);
+                        displacements, jumpCovariances, grid, 0.5, informative, sigmaEps);
                 Result c = evaluate(tree, lengths, observations, sigma, rate, weights,
-                        displacements, jumpCovariances, grid, 0.3819660112501051, informative);
+                        displacements, jumpCovariances, grid, 0.3819660112501051, informative, sigmaEps);
                 if (Double.isFinite(a.logLikelihood) && Double.isFinite(b.logLikelihood)
                         && Double.isFinite(c.logLikelihood)
                         && Math.max(Math.abs(a.logLikelihood - b.logLikelihood),
@@ -160,6 +197,31 @@ public final class TorusLogSpacePruning {
         for (int c = 0; c < tree.getChildCount(node); c++)
             any |= markInformative(tree.getChild(node, c), tree, observations, informative);
         return informative[node.getNumber()] = any;
+    }
+
+    /**
+     * Precision scale of a branch whose message covariance is time*Sigma + sigmaEps, or 0 when
+     * that branch is provably flat -- the same two uniformity tests inverseSharpTime applies,
+     * evaluated on the actual branch covariance.
+     *
+     * inverseSharpTime is this function specialised to sigmaEps == 0: there the branch precision
+     * norm is exactly precisionNorm(Sigma)/time, which is why it can return 1/time and let the
+     * caller multiply through. With sigmaEps added that factorisation is gone, so this returns
+     * the branch precision norm itself.
+     */
+    private static double sharpPrecision(double time, double[][] sigma, double[][] sigmaEps,
+                                         double rate, double minimumJumpVariance, int dim) {
+        double[][] base = new double[dim][dim];
+        for (int i = 0; i < dim; i++)
+            for (int j = 0; j < dim; j++)
+                base[i][j] = time * sigma[i][j] + (sigmaEps == null ? 0.0 : sigmaEps[i][j]);
+        double branchPrecisionNorm = new Gaussian(new double[dim], base).precisionNorm;
+        double logModeBound = dim * Math.log1p(Math.sqrt(TWO_PI * branchPrecisionNorm));
+        if (minimumJumpVariance > 0.0 && logModeBound
+                + rate * time * Math.expm1(-0.5 * minimumJumpVariance) < Math.log(SERIES_TOLERANCE)) return 0.0;
+        double q = Math.exp(-0.5 / branchPrecisionNorm);
+        if (Math.expm1(dim * Math.log1p(2.0 * q / (1.0 - q * q * q))) < SERIES_TOLERANCE) return 0.0;
+        return branchPrecisionNorm;
     }
 
     private static double inverseSharpTime(double time, double precisionNorm, double rate,
@@ -187,7 +249,8 @@ public final class TorusLogSpacePruning {
     private static Result evaluate(Tree tree, BranchLengths lengths, double[][] observations,
                                    double[][] sigma, double rate, double[] weights,
                                    double[][] displacements, double[][][] jumpCovariances,
-                                   int grid, double offset, boolean[] informative) {
+                                   int grid, double offset, boolean[] informative,
+                                   double[][] sigmaEps) {
         int dim = sigma.length, cells = 1;
         for (int i = 0; i < dim; i++) cells *= grid;
         int[][] coordinates = new int[cells][dim];
@@ -209,7 +272,7 @@ public final class TorusLogSpacePruning {
         double[][] partials = new double[tree.getNodeCount()][];
         Map<Double, double[]> transitions = new HashMap<Double, double[]>();
         prune(tree.getRoot(), tree, lengths, observations, sigma, rate, weights,
-                displacements, jumpCovariances, grid, coordinates, points, partials, transitions, offsets, offset != 0.0, informative);
+                displacements, jumpCovariances, grid, coordinates, points, partials, transitions, offsets, offset != 0.0, informative, sigmaEps);
         double ll = logSum(partials[tree.getRoot().getNumber()]) - Math.log(cells);
         return new Result(ll, grid, dim, coordinates, partials, transitions, tree, lengths);
     }
@@ -219,7 +282,8 @@ public final class TorusLogSpacePruning {
                               double[] weights, double[][] displacements, double[][][] jumpCovariances,
                               int grid, int[][] coordinates, double[][] points,
                               double[][] partials, Map<Double, double[]> transitions,
-                              double[][] offsets, boolean shifted, boolean[] informative) {
+                              double[][] offsets, boolean shifted, boolean[] informative,
+                              double[][] sigmaEps) {
         int cells = points.length, dim = sigma.length;
         double[] partial = new double[cells];
         for (int c = 0; c < tree.getChildCount(node); c++) {
@@ -233,10 +297,13 @@ public final class TorusLogSpacePruning {
                 for (int cell = 0; cell < cells; cell++)
                     for (int ax = 0; ax < dim; ax++) delta[cell][ax] = y[ax] - points[cell][ax]
                             - TWO_PI * offsets[node.getNumber()][ax] / grid;
-                message = logTransition(delta, sigma, time, rate, weights, displacements, jumpCovariances);
+                // TIP: the observation error convolves into the branch transition here, and
+                // ONLY here. Internal branches carry no tip error.
+                message = logTransition(delta, sigma, time, rate, weights, displacements,
+                        jumpCovariances, sigmaEps);
             } else {
                 prune(child, tree, lengths, observations, sigma, rate, weights, displacements,
-                        jumpCovariances, grid, coordinates, points, partials, transitions, offsets, shifted, informative);
+                        jumpCovariances, grid, coordinates, points, partials, transitions, offsets, shifted, informative, sigmaEps);
                 // Different node shifts change the branch displacement mesh. A
                 // shared origin shift would leave internal aliasing invisible.
                 double[] transition = shifted ? null : transitions.get(time);
@@ -299,12 +366,27 @@ public final class TorusLogSpacePruning {
     public static double[] logTransition(double[][] delta, double[][] sigma, double time,
                                          double rate, double[] weights, double[][] displacements,
                                          double[][][] jumpCovariances) {
+        return logTransition(delta, sigma, time, rate, weights, displacements, jumpCovariances, null);
+    }
+
+    /**
+     * As above, additionally convolved with a wrapped Gaussian of covariance sigmaEps
+     * (null = no convolution, bit-for-bit the original). Convolution adds sigmaEps to the
+     * base covariance time*Sigma, which every jump-count component of the Poisson mixture
+     * inherits, so this single addition is the whole change.
+     */
+    public static double[] logTransition(double[][] delta, double[][] sigma, double time,
+                                         double rate, double[] weights, double[][] displacements,
+                                         double[][][] jumpCovariances, double[][] sigmaEps) {
         if (!(time > 0.0) || !Double.isFinite(time) || rate < 0.0 || !Double.isFinite(rate))
             throw new IllegalArgumentException("branch time must be positive and jump rate nonnegative, both finite");
         int dim = sigma.length;
         double[][] base = new double[dim][dim];
         for (int i = 0; i < dim; i++)
             for (int j = 0; j < dim; j++) base[i][j] = time * sigma[i][j];
+        if (sigmaEps != null)
+            for (int i = 0; i < dim; i++)
+                for (int j = 0; j < dim; j++) base[i][j] += sigmaEps[i][j];
         Gaussian baseGaussian = new Gaussian(new double[dim], base);
         boolean hasJump = rate > 0.0 && jumpCovariances != null;
         if (!hasJump) return baseGaussian.logDensity(delta);

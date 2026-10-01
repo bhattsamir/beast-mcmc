@@ -512,6 +512,189 @@ public class TorusFourierTest extends TestCase {
                 like.getNodeRecomputeCount() > 0);
     }
 
+    // ---------------- tip observation error (Sigma_eps) ----------------
+    // Sigma_eps had ZERO committed coverage, so a refactor could have removed it in silence.
+    // Everything below is therefore an INDEPENDENT check, not a recorded engine output.
+
+    /** HA's tip observation error: 3.5 degrees isotropic, as a VARIANCE in radians^2. */
+    private static final double SIGMA_EPS_HA = 0.00373156339239;
+
+    /**
+     * (a) Two-tip cherry against its CLOSED FORM, with and without tip error.
+     *
+     * On the torus the wrapped-normal tip messages convolve, so a cherry's marginal likelihood
+     * under the flat root prior is exactly
+     *     -d*log(2*pi) + log WN(yA - yB ; (tA + tB)*Sigma + 2*Sigma_eps),
+     * with Sigma_eps entering ONCE PER TIP. The Sigma_eps = 0 case reproduces the published
+     * prototype value already asserted in testKernelTwoTip, which pins the normalisation
+     * convention; the Sigma_eps > 0 cases are the actual test.
+     */
+    public void testCherryTipErrorMatchesClosedForm() throws Exception {
+        final double[][] sigma = {{0.35, 0.08}, {0.08, 0.22}};
+        final double[] yA = {0.4, 1.1}, yB = {-1.2, 0.6};
+        final double tA = 0.7, tB = 1.4;
+
+        // convention anchor: same configuration and same number as testKernelTwoTip
+        assertEquals(-6.69298747149, cherryClosedForm(yA, yB, sigma, tA, tB, 0.0), 1.0e-9);
+
+        for (double eps : new double[]{0.0, SIGMA_EPS_HA, Math.pow(5.0 * Math.PI / 180.0, 2)}) {
+            double engine = cherryLikelihood(tA, tB, yA, yB, sigma, eps, 64);
+            assertEquals("Sigma_eps = " + eps + " rad^2",
+                    cherryClosedForm(yA, yB, sigma, tA, tB, eps), engine, 1.0e-9);
+        }
+        // tip error must MOVE the answer -- a test that passes with Sigma_eps ignored is no test
+        assertTrue(Math.abs(cherryLikelihood(tA, tB, yA, yB, sigma, SIGMA_EPS_HA, 64)
+                - cherryLikelihood(tA, tB, yA, yB, sigma, 0.0, 64)) > 1.0e-4);
+    }
+
+    /** A sigmaEpsilon parameter sitting at exactly zero must be the Dirac path to the last bit. */
+    public void testZeroTipErrorIsBitIdenticalToNoTipError() throws Exception {
+        final double[][] sigma = {{0.35, 0.08}, {0.08, 0.22}};
+        final double[] yA = {0.4, 1.1}, yB = {-1.2, 0.6};
+        double noParameter = cherry(0.7, 1.4, yA, yB, sigma, null, 64).getLogLikelihood();
+        double zeroParameter = cherry(0.7, 1.4, yA, yB, sigma,
+                new Parameter.Default("sigmaEpsilon", 0.0), 64).getLogLikelihood();
+        assertEquals(Double.doubleToLongBits(noParameter), Double.doubleToLongBits(zeroParameter));
+    }
+
+    /**
+     * (b) Dirac-versus-Sigma_eps grid convergence, on a terminal branch too short to resolve.
+     *
+     * With t*Sigma = 1e-7 rad^2 the Dirac tip is a delta as far as any affordable grid is
+     * concerned and its likelihood is still moving by hundreds of nats per doubling at n = 512.
+     * Adding 3.5 degrees of tip error makes the tip message a wrapped Gaussian of sd 0.061 rad,
+     * which n = 256 resolves to machine precision. That contrast IS the reason Sigma_eps exists,
+     * so assert both arms: convergence alone would also pass if Sigma_eps were silently dropped
+     * and the branch were long.
+     */
+    public void testTipErrorGridConvergenceVersusDirac() throws Exception {
+        final double[][] sigma = {{0.01, 0.0}, {0.0, 0.01}};
+        final double[] yA = {0.7, -1.3}, yB = {0.9, -1.1};
+        final double tA = 1.0e-5, tB = 0.5;
+
+        double eps128 = cherryLikelihood(tA, tB, yA, yB, sigma, SIGMA_EPS_HA, 128);
+        double eps256 = cherryLikelihood(tA, tB, yA, yB, sigma, SIGMA_EPS_HA, 256);
+        double eps512 = cherryLikelihood(tA, tB, yA, yB, sigma, SIGMA_EPS_HA, 512);
+        assertEquals("Sigma_eps arm must be converged by nGrid 256", eps128, eps256, 1.0e-6);
+        assertEquals("Sigma_eps arm must be at machine precision by nGrid 512", eps256, eps512, 1.0e-12);
+        assertEquals("converged value must be the closed form",
+                cherryClosedForm(yA, yB, sigma, tA, tB, SIGMA_EPS_HA), eps512, 1.0e-8);
+
+        double dirac256 = cherryLikelihood(tA, tB, yA, yB, sigma, 0.0, 256);
+        double dirac512 = cherryLikelihood(tA, tB, yA, yB, sigma, 0.0, 512);
+        // measured: -696.57 -> -7.39, i.e. +689 nats on one doubling
+        assertTrue("the Dirac arm on this branch must NOT be converged (it moved "
+                        + (dirac512 - dirac256) + " nats from nGrid 256 to 512)",
+                Math.abs(dirac512 - dirac256) > 100.0);
+    }
+
+    /**
+     * (c) The positive log-space reference must ACCEPT the sharp cell once the tip carries
+     * error. Its grid-refinement bound used to be computed on the Dirac assumption, so
+     * -Dtorus.validate=true and ancestral-state reconstruction threw AccuracyException at
+     * exactly the configurations Sigma_eps was introduced to make tractable -- while the
+     * unvalidated production path returned a number, which is the dangerous half.
+     */
+    public void testReferenceValidatesSharpTipWithTipError() throws Exception {
+        final double[][] sigma = {{0.01, 0.0}, {0.0, 0.01}};
+        final double[] yA = {0.7, -1.3}, yB = {0.9, -1.1};
+        final double tA = 1.0e-5, tB = 0.5;
+
+        TorusFourierTreeLikelihood.setValidateEveryEvaluation(true);
+        try {
+            try {
+                cherryLikelihood(tA, tB, yA, yB, sigma, 0.0, 128);
+                fail("a Dirac tip on a 1e-5 branch cannot be validated at any affordable grid");
+            } catch (TorusLogSpacePruning.AccuracyException expected) {
+                assertTrue(expected.getMessage().contains("resource cap"));
+            }
+            double validated = cherryLikelihood(tA, tB, yA, yB, sigma, SIGMA_EPS_HA, 128);
+            assertEquals(cherryClosedForm(yA, yB, sigma, tA, tB, SIGMA_EPS_HA), validated, 1.0e-8);
+        } finally {
+            TorusFourierTreeLikelihood.setValidateEveryEvaluation(false);
+        }
+    }
+
+    /** Every run must be able to say what tip error it used; getReport is one of the places. */
+    public void testReportStatesSigmaEpsilon() throws Exception {
+        final double[][] sigma = {{0.35, 0.08}, {0.08, 0.22}};
+        final double[] yA = {0.4, 1.1}, yB = {-1.2, 0.6};
+        assertTrue(cherryLikelihoodObject(0.7, 1.4, yA, yB, sigma, 0.0, 64).getReport()
+                .contains("SIGMA_EPS = NONE"));
+        String applied = cherryLikelihoodObject(0.7, 1.4, yA, yB, sigma, SIGMA_EPS_HA, 64).getReport();
+        assertTrue(applied, applied.contains("SIGMA_EPS = [" + SIGMA_EPS_HA));
+    }
+
+    /** Sigma_eps is a covariance: a negative variance would make the leaf damping factor
+     *  exp(-m'Sigma_eps m/2) grow without bound, which nothing downstream would flag. */
+    public void testNegativeTipErrorRejected() throws Exception {
+        final double[][] sigma = {{0.35, 0.08}, {0.08, 0.22}};
+        try {
+            cherry(0.7, 1.4, new double[]{0.4, 1.1}, new double[]{-1.2, 0.6}, sigma,
+                    new Parameter.Default("sigmaEpsilon", -0.01), 64);
+            fail("a negative Sigma_eps must not build a likelihood");
+        } catch (IllegalArgumentException expected) {
+            assertTrue(expected.getMessage(), expected.getMessage().contains("sigmaEpsilon"));
+        }
+    }
+
+    /** Cherry log-likelihood with an isotropic tip-error VARIANCE in rad^2; 0 = Dirac tips. */
+    private static double cherryLikelihood(double tA, double tB, double[] yA, double[] yB,
+                                           double[][] sigma, double eps, int grid) throws Exception {
+        return cherryLikelihoodObject(tA, tB, yA, yB, sigma, eps, grid).getLogLikelihood();
+    }
+
+    private static TorusFourierTreeLikelihood cherryLikelihoodObject(
+            double tA, double tB, double[] yA, double[] yB, double[][] sigma, double eps, int grid)
+            throws Exception {
+        return cherry(tA, tB, yA, yB, sigma,
+                eps == 0.0 ? null : new Parameter.Default("sigmaEpsilon", eps), grid);
+    }
+
+    private static TorusFourierTreeLikelihood cherry(
+            double tA, double tB, double[] yA, double[] yB, double[][] sigma,
+            Parameter sigmaEpsilon, int grid) throws Exception {
+        Tree tree = new NewickImporter("(A:" + tA + ",B:" + tB + ");").importTree(null);
+        double[][] data = new double[tree.getExternalNodeCount()][];
+        for (int e = 0; e < tree.getExternalNodeCount(); e++) {
+            NodeRef x = tree.getExternalNode(e);
+            data[x.getNumber()] = tree.getNodeTaxon(x).getId().equals("A") ? yA : yB;
+        }
+        List<MatrixParameter> precs = new ArrayList<MatrixParameter>();
+        precs.add(precisionParameter(invert2x2(sigma)));
+        return new TorusFourierTreeLikelihood("cherry", tree, null, precs,
+                new double[][][]{data}, new TorusFourierKernel(sigma.length, grid),
+                null, null, null, null, sigmaEpsilon);
+    }
+
+    /** -d*log(2*pi) + log WN(yA - yB ; (tA + tB)*Sigma + 2*Sigma_eps), summed over windings. */
+    private static double cherryClosedForm(double[] yA, double[] yB, double[][] sigma,
+                                           double tA, double tB, double eps) {
+        final int d = sigma.length;
+        double[][] c = new double[d][d];
+        for (int i = 0; i < d; i++)
+            for (int j = 0; j < d; j++)
+                c[i][j] = (tA + tB) * sigma[i][j] + (i == j ? 2.0 * eps : 0.0);
+        final double[][] p = invert2x2(c);
+        final double det = c[0][0] * c[1][1] - c[0][1] * c[1][0];
+        final double norm = 1.0 / Math.sqrt(4.0 * Math.PI * Math.PI * det);
+        double total = 0.0;
+        for (int k0 = -8; k0 <= 8; k0++) {
+            for (int k1 = -8; k1 <= 8; k1++) {
+                double v0 = yA[0] - yB[0] + 2.0 * Math.PI * k0;
+                double v1 = yA[1] - yB[1] + 2.0 * Math.PI * k1;
+                double q = v0 * (p[0][0] * v0 + p[0][1] * v1) + v1 * (p[1][0] * v0 + p[1][1] * v1);
+                total += norm * Math.exp(-0.5 * q);
+            }
+        }
+        return -d * Math.log(2.0 * Math.PI) + Math.log(total);
+    }
+
+    private static double[][] invert2x2(double[][] m) {
+        double det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+        return new double[][]{{m[1][1] / det, -m[0][1] / det}, {-m[1][0] / det, m[0][0] / det}};
+    }
+
     // ---- helpers ----
 
     private static final java.util.Map<String, double[]> P2_OBS = new HashMap<String, double[]>() {{
