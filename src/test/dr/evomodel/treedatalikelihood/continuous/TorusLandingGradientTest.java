@@ -323,8 +323,15 @@ public class TorusLandingGradientTest extends TestCase {
         assertEquals(Double.NEGATIVE_INFINITY, f.like.getLogLikelihood());
         assertEquals(1L, f.like.getLandingUndefinedEvaluations());
         long before = f.like.getLandingUndefinedGradients();
+        TorusFourierGradient provider = new TorusFourierGradient(f.like, 0);
+        dr.inference.loggers.LogColumn[] columns = provider.getColumns();
+        assertEquals(2, columns.length);
+        assertEquals("torus.landingUndefinedGradients", columns[0].getLabel());
+        assertEquals("torus.landingUndefinedEvaluations", columns[1].getLabel());
+        assertEquals(Long.toString(before), columns[0].getFormatted().trim());
+        assertEquals("1", columns[1].getFormatted().trim());
         try {
-            f.like.getResidueGradient(0);
+            provider.getGradientLogDensity();
             fail("a -inf landing state must not yield a finite gradient");
         } catch (ArithmeticException expected) {
             assertTrue(expected.getMessage().contains("non-positive"));
@@ -332,5 +339,10 @@ public class TorusLandingGradientTest extends TestCase {
         assertEquals(before + 1, f.like.getLandingUndefinedGradients());
         assertEquals("the read-only sweep must not touch the value-path audit",
                 1L, f.like.getLandingUndefinedEvaluations());
+        // the log columns read the live counters and change nothing
+        assertEquals(Long.toString(before + 1), columns[0].getFormatted().trim());
+        assertEquals("1", columns[1].getFormatted().trim());
+        assertEquals(before + 1, f.like.getLandingUndefinedGradients());
+        assertEquals(1L, f.like.getLandingUndefinedEvaluations());
     }
 }

@@ -1,6 +1,8 @@
 package dr.evomodel.treedatalikelihood.continuous;
 
 import dr.inference.hmc.GradientWrtParameterProvider;
+import dr.inference.loggers.LogColumn;
+import dr.inference.loggers.Loggable;
 import dr.inference.model.CompoundParameter;
 import dr.inference.model.CompoundSymmetricMatrix;
 import dr.inference.model.Likelihood;
@@ -18,8 +20,14 @@ import java.util.Set;
  * [precision diagonal 1, precision diagonal 2, precision correlation, jump rate].
  * Prior scores and the coordinate-transform Jacobian are supplied separately by
  * BEAST's joint gradient and HMC transform. No copy of a sampled value is made.
+ *
+ * As a Loggable it reports the likelihood's cumulative landing audit counters, so an HMC run
+ * can be checked for trajectories rejected because the landing likelihood is undefined (-inf,
+ * non-positive truncated root integral) at the chosen nGrid: HMC cannot cross such a pocket,
+ * MH can jump over one. Both counters belong to the whole likelihood (all its residues) and
+ * are always 0 under the shift law. Logging them reads two counters and changes no state.
  */
-public final class TorusFourierGradient implements GradientWrtParameterProvider {
+public final class TorusFourierGradient implements GradientWrtParameterProvider, Loggable {
     private final TorusFourierTreeLikelihood likelihood;
     private final int residue;
     private final CompoundParameter parameter;
@@ -136,6 +144,29 @@ public final class TorusFourierGradient implements GradientWrtParameterProvider 
     @Override
     public double[] getGradientLogDensity() {
         return likelihood.getResidueGradient(residue);
+    }
+
+    /**
+     * torus.landingUndefinedGradients: gradient sweeps that met a non-positive landing root
+     * integral (each one rejects the HMC trajectory it occurred in);
+     * torus.landingUndefinedEvaluations: likelihood evaluations that returned -inf for the same reason.
+     */
+    @Override
+    public LogColumn[] getColumns() {
+        return new LogColumn[]{
+                new LogColumn.Abstract("torus.landingUndefinedGradients") {
+                    @Override
+                    protected String getFormattedValue() {
+                        return Long.toString(likelihood.getLandingUndefinedGradients());
+                    }
+                },
+                new LogColumn.Abstract("torus.landingUndefinedEvaluations") {
+                    @Override
+                    protected String getFormattedValue() {
+                        return Long.toString(likelihood.getLandingUndefinedEvaluations());
+                    }
+                }
+        };
     }
 
     /**
