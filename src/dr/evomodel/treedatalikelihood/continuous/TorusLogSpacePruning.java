@@ -111,7 +111,9 @@ public final class TorusLogSpacePruning {
      * A tip message becomes the branch transition convolved with N(0, sigmaEps), and on
      * the torus that convolution just adds sigmaEps to the covariance of every Poisson
      * jump-count component -- i.e. to the base covariance time*Sigma. Nothing else in the
-     * reference changes.
+     * reference changes. A tip with only some coordinates observed contributes the
+     * MARGINAL over the observed axes, so sigmaEps is projected to the same axes as sigma
+     * and the jump covariances (projectCovariance).
      *
      * The grid-refinement bound below uses the SAME covariance: a tip branch is bounded on
      * time*Sigma + sigmaEps, not on time*Sigma alone. Bounding it on the Dirac assumption was
@@ -126,6 +128,7 @@ public final class TorusLogSpacePruning {
                                    double[][] sigmaEps) {
         final int dim = sigma.length;
         if (dim < 1 || dim > 3) throw new AccuracyException("reference supports dimensions 1 to 3");
+        for (double[] observation : observations) observedAxes(observation, dim);
         final Gaussian diffusion = new Gaussian(new double[dim], sigma);
         double minimumJumpVariance = 0.0;
         if (rate > 0.0 && jumpCovariances != null && weights != null
@@ -192,7 +195,12 @@ public final class TorusLogSpacePruning {
 
     private static boolean markInformative(NodeRef node, Tree tree, double[][] observations,
                                            boolean[] informative) {
-        if (tree.isExternal(node)) return informative[node.getNumber()] = observations[node.getNumber()] != null;
+        if (tree.isExternal(node)) {
+            double[] observation = observations[node.getNumber()];
+            boolean any = false;
+            if (observation != null) for (double value : observation) any |= !Double.isNaN(value);
+            return informative[node.getNumber()] = any;
+        }
         boolean any = false;
         for (int c = 0; c < tree.getChildCount(node); c++)
             any |= markInformative(tree.getChild(node, c), tree, observations, informative);
@@ -292,18 +300,47 @@ public final class TorusLogSpacePruning {
             double[] message;
             if (tree.isExternal(child)) {
                 double[] y = observations[child.getNumber()];
-                if (y == null) continue;
-                double[][] delta = new double[cells][dim];
+                int[] axes = observedAxes(y, dim);
+                if (axes.length == 0) continue;
+                double[][] delta = new double[cells][axes.length];
                 for (int cell = 0; cell < cells; cell++)
-                    for (int ax = 0; ax < dim; ax++) delta[cell][ax] = y[ax] - points[cell][ax]
-                            - TWO_PI * offsets[node.getNumber()][ax] / grid;
+                    for (int a = 0; a < axes.length; a++) {
+                        int ax = axes[a];
+                        delta[cell][a] = y[ax] - points[cell][ax]
+                                - TWO_PI * offsets[node.getNumber()][ax] / grid;
+                    }
+                // Integrating an unobserved tip coordinate gives the marginal
+                // transition on the observed axes, with no extra torus-volume factor.
+                // Project covariance, not precision: a precision submatrix would
+                // describe a conditional distribution instead of a marginal.
                 // TIP: the observation error convolves into the branch transition here, and
-                // ONLY here. Internal branches carry no tip error.
-                message = logTransition(delta, sigma, time, rate, weights, displacements,
-                        jumpCovariances, sigmaEps);
+                // ONLY here. Internal branches carry no tip error. When some coordinates are
+                // missing the tip contributes the marginal over the observed axes, so
+                // sigmaEps is projected with them -- a covariance submatrix, like sigma.
+                if (axes.length == dim) {
+                    message = logTransition(delta, sigma, time, rate, weights, displacements,
+                            jumpCovariances, sigmaEps);
+                } else {
+                    double[][] means = null;
+                    double[][][] covariances = null;
+                    if (displacements != null) {
+                        means = new double[displacements.length][axes.length];
+                        for (int k = 0; k < means.length; k++)
+                            for (int a = 0; a < axes.length; a++) means[k][a] = displacements[k][axes[a]];
+                    }
+                    if (jumpCovariances != null) {
+                        covariances = new double[jumpCovariances.length][][];
+                        for (int k = 0; k < covariances.length; k++)
+                            covariances[k] = projectCovariance(jumpCovariances[k], axes);
+                    }
+                    message = logTransition(delta, projectCovariance(sigma, axes), time, rate,
+                            weights, means, covariances,
+                            sigmaEps == null ? null : projectCovariance(sigmaEps, axes));
+                }
             } else {
                 prune(child, tree, lengths, observations, sigma, rate, weights, displacements,
-                        jumpCovariances, grid, coordinates, points, partials, transitions, offsets, shifted, informative, sigmaEps);
+                        jumpCovariances, grid, coordinates, points, partials, transitions, offsets, shifted, informative,
+                        sigmaEps);
                 // Different node shifts change the branch displacement mesh. A
                 // shared origin shift would leave internal aliasing invisible.
                 double[] transition = shifted ? null : transitions.get(time);
@@ -327,6 +364,27 @@ public final class TorusLogSpacePruning {
             for (int cell = 0; cell < cells; cell++) partial[cell] += message[cell];
         }
         partials[node.getNumber()] = partial;
+    }
+
+    private static int[] observedAxes(double[] observation, int dim) {
+        if (observation == null) return new int[0];
+        if (observation.length != dim) throw new IllegalArgumentException("Tip observation dimension mismatch");
+        int count = 0;
+        for (double value : observation) {
+            if (Double.isInfinite(value)) throw new IllegalArgumentException("Tip angles must be finite or NaN");
+            if (!Double.isNaN(value)) count++;
+        }
+        int[] axes = new int[count];
+        int a = 0;
+        for (int i = 0; i < dim; i++) if (!Double.isNaN(observation[i])) axes[a++] = i;
+        return axes;
+    }
+
+    private static double[][] projectCovariance(double[][] matrix, int[] axes) {
+        double[][] marginal = new double[axes.length][axes.length];
+        for (int i = 0; i < axes.length; i++)
+            for (int j = 0; j < axes.length; j++) marginal[i][j] = matrix[axes[i]][axes[j]];
+        return marginal;
     }
 
     private static double[] propagate(double[] child, double[] transition,

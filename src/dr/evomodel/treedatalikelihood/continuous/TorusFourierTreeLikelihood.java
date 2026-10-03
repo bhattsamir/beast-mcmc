@@ -21,15 +21,21 @@ import java.util.logging.Logger;
 
 /**
  * Felsenstein pruning likelihood for independent d-dimensional wrapped-Brownian
- * diffusions (one per residue) on a flat torus. Tips may carry a wrapped-Gaussian
- * observation error Sigma_eps (see {@code sigmaEpsilon}); with Sigma_eps absent or zero
- * they are Dirac point observations for shift; landing requires positive Sigma_eps.
+ * jump-diffusions (one per residue) on a flat torus, under one of two jump laws:
+ * SHIFT (additive, basin-directed displacements) or LANDING (each jump replaces the
+ * angles by a draw from a fixed wrapped-normal mixture; stationary landing root).
+ * Production uses FFT propagation. Tips may carry a wrapped-Gaussian observation error
+ * Sigma_eps (see {@code sigmaEpsilon}); with Sigma_eps absent or zero they are Dirac
+ * point observations for shift; landing requires positive Sigma_eps. Under LANDING a tip
+ * missing any coordinate is masked whole (flat message), as in the production engine;
+ * under SHIFT such a tip is a partial observation.
  * Optional per-evaluation validation uses a positive reference for the selected law;
  * the reference result replaces an inaccurate FFT likelihood. Ancestral logging draws
  * internal states jointly by a downward pass over the cached FFT partials, with the
  * zero-jump half of every branch kernel evaluated exactly in real space (see
  * TorusFourierKernel, "ancestral sampling"); when a positive reference is present, as under
- * validation, draws come from that reference instead.
+ * validation, draws come from that reference instead. Analytic HMC gradients (both laws)
+ * differentiate the production FFT calculation only.
  *
  * <p>Partial likelihoods are cached per node and per residue, following BEAST's
  * standard tree-likelihood scheme (cf. {@code AbstractTreeLikelihood} /
@@ -55,6 +61,12 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     private final BranchRateModel branchRateModel;     // nullable -> rate 1
     private final List<MatrixParameter> precisions;    // one dim x dim precision per residue
     private final double[][][] tipData;                // [residue][externalNodeNumber][dim], radians
+    // LANDING view of tipData: a tip missing ANY coordinate (NaN) is null, i.e. masked whole
+    // with a flat message -- the semantics of the production landing engine (job 846999),
+    // whose parser returned null for such tips. The shift path keeps partial observation.
+    // A copy, never a mutation of the caller's array. Null under SHIFT.
+    private final double[][][] landingTipData;
+    private final int landingMaskedPartialTips;
     private final TorusFourierKernel kernel;
     private final JumpLaw jumpLaw;
     // One fixed landing distribution per likelihood, shared by its residues. Unlike
@@ -95,7 +107,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     private final int n2;
     private final int dim;
     private final int nodeCount;
-    // Shared all-ones leaf message for masked (missing) tips: a residue absent at a taxon
+    // Shared all-ones leaf message for entirely missing tips: a residue absent at a taxon
     // (tipData[r][tip] == null) contributes a flat message, i.e. its value is marginalised out
     // exactly as internal nodes are. Read-only during the sweep, so it is safe to share.
     private final double[] flatLeaf;
@@ -111,6 +123,9 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     private final double[][] nodeLogScale;             // [nResidues][nodeCount]
     private final int[][] storedCurrentIndex;
     private final double[][] storedNodeLogScale;
+    // During a proposal, preserve the stored buffer even when HMC evaluates many
+    // intermediate parameter values. All writes use the other buffer until accept/restore.
+    private boolean stateStored = false;
 
     // ---- dirty bookkeeping ----
     private final boolean[] updateNode;                // [nodeCount], shared across residues (tree/rate moves)
@@ -271,10 +286,35 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
                 throw new IllegalArgumentException("tipData residue " + r + " has "
                         + tipData[r].length + " taxa, tree has " + tree.getExternalNodeCount());
             }
+            for (double[] tip : tipData[r]) {
+                if (tip == null) continue;
+                if (tip.length != dim) throw new IllegalArgumentException("Tip observation dimension mismatch");
+                for (double value : tip) if (Double.isInfinite(value))
+                    throw new IllegalArgumentException("Tip angles must be finite or NaN for missing coordinates");
+            }
             final MatrixParameter p = precisions.get(r);
             if (p.getRowDimension() != dim || p.getColumnDimension() != dim) {
                 throw new IllegalArgumentException("precision " + r + " must be " + dim + "x" + dim);
             }
+        }
+        if (jumpLaw == JumpLaw.LANDING) {
+            int masked = 0;
+            this.landingTipData = new double[nResidues][][];
+            for (int r = 0; r < nResidues; r++) {
+                landingTipData[r] = new double[tipData[r].length][];
+                for (int i = 0; i < tipData[r].length; i++) {
+                    final double[] tip = tipData[r][i];
+                    if (tip == null) continue;
+                    boolean missing = false;
+                    for (double value : tip) if (Double.isNaN(value)) missing = true;
+                    if (missing) masked++;
+                    else landingTipData[r][i] = tip;
+                }
+            }
+            this.landingMaskedPartialTips = masked;
+        } else {
+            this.landingTipData = null;
+            this.landingMaskedPartialTips = 0;
         }
 
         // Allocate the double-buffered partial store. Only internal nodes hold a
@@ -331,6 +371,11 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             Logger.getLogger("dr.evomodel").info("TorusFourierTreeLikelihood '" + name
                     + "': JUMP_LAW = landing (fixed absolute basin means, stationary landing root), nGrid="
                     + kernel.getGridSize() + ", strict numerical audit=" + strictLandingNumerics);
+            if (landingMaskedPartialTips > 0) {
+                Logger.getLogger("dr.evomodel").info("TorusFourierTreeLikelihood '" + name + "': LANDING: "
+                        + landingMaskedPartialTips + " tips with a missing coordinate are masked whole,"
+                        + " as-ran semantics");
+            }
         }
     }
 
@@ -505,6 +550,186 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         return sb.toString();
     }
 
+    public int getResidueCount() { return nResidues; }
+
+    public MatrixParameter getResiduePrecision(int residue) { return precisions.get(residue); }
+
+    public Parameter getJumpRateParameter() { return jumpRate; }
+
+    /**
+     * Derivatives of one residue's production log likelihood with respect to its
+     * two precision diagonals, precision correlation, and jump rate, in that order.
+     * This read-only sweep does not alter the likelihood/ancestral caches. The
+     * rate derivative is residue-specific: a shared-rate sampler would need to
+     * sum this component across residues.
+     */
+    public double[] getResidueGradient(int residue) {
+        return residueGradient(residue, false);
+    }
+
+    /**
+     * As getResidueGradient(), plus a fifth component: the derivative with respect to an
+     * ISOTROPIC tip observation-error variance s (radians^2), i.e. Sigma_eps = s*I.
+     *
+     * Sigma_eps is fixed in the HA analysis, so nothing samples this; it exists so the
+     * identifiability question -- can the data tell Sigma_eps from Sigma? -- can be asked
+     * with a score rather than by re-running the chain, and so the tip-error terms in the
+     * other four components have an independent finite-difference check.
+     */
+    public double[] getResidueGradientWithTipError(int residue) {
+        if (sigmaEpsilon != null
+                && (sigmaEpsilon instanceof MatrixParameter || sigmaEpsilon.getDimension() != 1)) {
+            throw new IllegalArgumentException("d/dSigma_eps is implemented for an isotropic "
+                    + "(dimension-1) sigmaEpsilon; a per-axis or full-matrix Sigma_eps needs one "
+                    + "direction per free entry");
+        }
+        return residueGradient(residue, true);
+    }
+
+    private double[] residueGradient(int residue, boolean tipError) {
+        if (validateEveryEvaluation) {
+            throw new IllegalStateException("Torus HMC gradients require torus.validate=false; "
+                    + "they differentiate the FFT likelihood, not adaptive reference quadrature");
+        }
+        if (dim != 2 || !(precisions.get(residue) instanceof CompoundSymmetricMatrix)) {
+            throw new IllegalArgumentException("Torus HMC requires a 2x2 compoundSymmetricMatrix precision");
+        }
+        CompoundSymmetricMatrix precision = (CompoundSymmetricMatrix) precisions.get(residue);
+        if (!precision.asCorrelation() || precision.isCholesky()) {
+            throw new IllegalArgumentException("Torus HMC requires asCorrelation=true and isCholesky=false");
+        }
+        double q1 = precision.getDiagonalParameter().getParameterValue(0);
+        double q2 = precision.getDiagonalParameter().getParameterValue(1);
+        double rho = precision.getOffDiagonalParameter().getParameterValue(0);
+        if (!(q1 > 0.0) || !(q2 > 0.0) || !Double.isFinite(q1) || !Double.isFinite(q2)
+                || !(Math.abs(rho) < 1.0)) {
+            throw new ArithmeticException("Invalid precision in torus gradient");
+        }
+        final double[][] sigma = invertPrecision(precision);
+        final double rate = jumpRateValue(residue);
+        if (!Double.isFinite(rate) || rate < 0.0) {
+            throw new ArithmeticException("Invalid jump rate in torus gradient");
+        }
+        final int parameters = tipError ? 5 : 4;
+        final double[][][] dPrecision = new double[parameters][2][2];
+        dPrecision[0][0][0] = 1.0;
+        dPrecision[1][1][1] = 1.0;
+        dPrecision[0][0][1] = dPrecision[0][1][0] = 0.5 * rho * Math.sqrt(q2 / q1);
+        dPrecision[1][0][1] = dPrecision[1][1][0] = 0.5 * rho * Math.sqrt(q1 / q2);
+        dPrecision[2][0][1] = dPrecision[2][1][0] = Math.sqrt(q1) * Math.sqrt(q2);
+        final double[][][] dSigma = new double[parameters][2][2];
+        // d(Q^-1) = -Q^-1 (dQ) Q^-1.
+        for (int p = 0; p < 3; p++) {
+            for (int i = 0; i < 2; i++) {
+                for (int j = 0; j < 2; j++) {
+                    for (int a = 0; a < 2; a++) {
+                        for (int b = 0; b < 2; b++) {
+                            dSigma[p][i][j] -= sigma[i][a] * dPrecision[p][a][b] * sigma[b][j];
+                        }
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) {
+            if (!Double.isFinite(sigma[i][j]))
+                throw new ArithmeticException("Covariance overflow in torus gradient");
+            for (int p = 0; p < parameters; p++) if (!Double.isFinite(dSigma[p][i][j]))
+                throw new ArithmeticException("Covariance derivative overflow in torus gradient");
+        }
+        final double[] dRate = new double[parameters];
+        dRate[3] = 1.0;
+        // Sigma_eps enters the leaf kernel only, so its direction is carried separately from
+        // dSigma: it must NOT be folded into the diffusion covariance, which every branch sees.
+        double[][][] dSigmaEps = null;
+        if (tipError) {
+            dSigmaEps = new double[parameters][2][2];
+            dSigmaEps[4][0][0] = 1.0;                 // Sigma_eps = s*I  ->  d/ds = I
+            dSigmaEps[4][1][1] = 1.0;
+        }
+        TorusFourierKernel.GradientContext context = kernel.prepareGradientContext(
+                sigma, rate, jumpW, jumpD, jumpS,
+                dSigma, dRate, sigmaEpsilonMatrix(), dSigmaEps);
+        GradientPartial root = gradientPartial(residue, tree.getRoot(), context);
+        double total = 0.0;
+        for (double v : root.values) total += v;
+        if (!(total > 0.0) || !Double.isFinite(total)) {
+            throw new ArithmeticException("Nonfinite torus likelihood in gradient evaluation");
+        }
+        double[] result = root.logScaleGradient.clone();
+        for (int p = 0; p < result.length; p++) {
+            double derivative = 0.0;
+            for (double v : root.gradients[p]) derivative += v;
+            result[p] += derivative / total;
+            if (!Double.isFinite(result[p])) {
+                throw new ArithmeticException("Nonfinite torus likelihood gradient");
+            }
+        }
+        return result;
+    }
+
+    private static final class GradientPartial {
+        final double[] values;
+        final double[][] gradients;
+        final double[] logScaleGradient;
+
+        GradientPartial(int size, int parameters) {
+            values = new double[size];
+            Arrays.fill(values, 1.0);
+            gradients = new double[parameters][size];
+            logScaleGradient = new double[parameters];
+        }
+    }
+
+    /** Forward differentiation, with the same per-child normalization as updateNodePartial. */
+    private GradientPartial gradientPartial(int residue, NodeRef node,
+                                            TorusFourierKernel.GradientContext context) {
+        final int parameters = context.getParameterCount();
+        GradientPartial partial = new GradientPartial(n2, parameters);
+        for (int c = 0; c < tree.getChildCount(node); c++) {
+            NodeRef child = tree.getChild(node, c);
+            TorusFourierKernel.ValueGradient message;
+            if (tree.isExternal(child)) {
+                double[] observation = tipData[residue][child.getNumber()];
+                if (observation == null) continue; // neutral message and zero derivative
+                message = kernel.leafKernelWithGradient(observation, branchLength(child), context);
+            } else {
+                GradientPartial childPartial = gradientPartial(residue, child, context);
+                message = kernel.propagateWithGradient(childPartial.values, childPartial.gradients,
+                        branchLength(child), context);
+                for (int p = 0; p < parameters; p++) {
+                    partial.logScaleGradient[p] += childPartial.logScaleGradient[p];
+                }
+            }
+            double max = 0.0;
+            int peakIndex = 0;
+            for (int k = 0; k < n2; k++) {
+                final double previous = partial.values[k];
+                for (int p = 0; p < parameters; p++) {
+                    partial.gradients[p][k] = partial.gradients[p][k] * message.values[k]
+                            + previous * message.gradients[p][k];
+                }
+                partial.values[k] = previous * message.values[k];
+                if (partial.values[k] > max) {
+                    max = partial.values[k];
+                    peakIndex = k;
+                }
+            }
+            if (!(max > 0.0) || !Double.isFinite(max)) {
+                throw new ArithmeticException("Torus subtree underflow or overflow in gradient evaluation");
+            }
+            for (int p = 0; p < parameters; p++) {
+                double dLogScale = partial.gradients[p][peakIndex] / max;
+                partial.logScaleGradient[p] += dLogScale;
+                for (int k = 0; k < n2; k++) {
+                    partial.gradients[p][k] = partial.gradients[p][k] / max
+                            - (partial.values[k] / max) * dLogScale;
+                }
+            }
+            for (int k = 0; k < n2; k++) partial.values[k] /= max;
+        }
+        return partial;
+    }
+
     private double calculateLogLikelihood() {
         if (jumpLaw == JumpLaw.LANDING) return calculateLandingLogLikelihood();
         final NodeRef root = tree.getRoot();
@@ -527,13 +752,10 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         stream.forEach(r -> {
             final double[][] sigma = invertPrecision(precisions.get(r));
             final double jr = jumpRateValue(r);
-            double[] psiRe = null, psiIm = null;
-            if (jr > 0.0 && jumpS != null) {     // precompute the branch-independent jump exponent once per residue
-                psiRe = new double[n2];
-                psiIm = new double[n2];
-                kernel.computePsiComplex(sigma, jr, jumpW, jumpD, jumpS, psiRe, psiIm);
-            }
-            boolean changed = updateNodePartial(r, root, sigma, psiRe, psiIm, jr, sigmaEps);
+            // The branch-independent jump exponent is needed once per residue, but only if
+            // some node in this residue actually recomputes; see PsiCache.
+            final PsiCache psi = new PsiCache(sigma, jr);
+            boolean changed = updateNodePartial(r, root, sigma, psi, jr, sigmaEps);
             if (changed || Double.isNaN(acceptedResidueLogL[r])) {
                 final int rn = root.getNumber();
                 double fft = nodeLogScale[r][rn]
@@ -565,12 +787,55 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     }
 
     /**
+     * The Levy-Khintchine exponent psi(m) for one residue, computed on first use.
+     *
+     * <p>psi depends only on the residue's covariance, its jump rate and the (fixed)
+     * mixture -- not on any branch -- so it is computed once per residue per evaluation
+     * and reused by every branch. It used to be computed eagerly, before
+     * {@link #updateNodePartial} had consulted the dirty flags, which meant a move that
+     * touches one residue still paid for all of them: two double[nGrid^dim] and a full
+     * grid pass each (318 residues x 2.7 ms = 0.86 s per evaluation at nGrid 128), every
+     * bit of it discarded. Deferring to the first node that actually recomputes changes
+     * no arithmetic -- psi is a pure function of state that is re-read each evaluation,
+     * and computePsiComplex has no side effects beyond the arrays passed to it -- while
+     * making a clean residue cost nothing.
+     *
+     * <p>Confined to a single residue's recursion, which is single-threaded: the parallel
+     * stream in {@link #calculateLogLikelihood} fans out over residues, never within one.
+     * So no synchronisation is needed.
+     */
+    private final class PsiCache {
+        /** Whether this residue has jumps at all. Known without computing psi. */
+        final boolean hasJump;
+        private final double[][] sigma;
+        private final double rate;
+        private double[] re, im;
+
+        PsiCache(double[][] sigma, double rate) {
+            this.sigma = sigma;
+            this.rate = rate;
+            this.hasJump = rate > 0.0 && jumpS != null;
+        }
+
+        private void ensure() {
+            if (re == null) {
+                re = new double[n2];
+                im = new double[n2];
+                kernel.computePsiComplex(sigma, rate, jumpW, jumpD, jumpS, re, im);
+            }
+        }
+
+        double[] re() { ensure(); return re; }
+        double[] im() { ensure(); return im; }
+    }
+
+    /**
      * Ensure node's cached partial (and subtree log-scale) for residue r are current,
      * recomputing iff the node is flagged, the residue's precision changed, or a child
      * was recomputed. Returns whether this node was recomputed, so the parent can
      * propagate the dirty path upward. Mirrors prune_loglik on a cache miss.
      */
-    private boolean updateNodePartial(int r, NodeRef node, double[][] sigma, double[] psiRe, double[] psiIm,
+    private boolean updateNodePartial(int r, NodeRef node, double[][] sigma, PsiCache psi,
                                       double jumpRate, double[][] sigmaEps) {
         final int nn = node.getNumber();
         final int childCount = tree.getChildCount(node);
@@ -579,7 +844,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         for (int c = 0; c < childCount; c++) {
             final NodeRef child = tree.getChild(node, c);
             if (!tree.isExternal(child)) {
-                childRecomputed |= updateNodePartial(r, child, sigma, psiRe, psiIm, jumpRate, sigmaEps);
+                childRecomputed |= updateNodePartial(r, child, sigma, psi, jumpRate, sigmaEps);
             } else {
                 // Tips hold no cached partial (the leaf message is rebuilt on the fly),
                 // so their own dirty flag must be consulted here: a sampled tip-date or
@@ -593,10 +858,13 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             return false;   // cache hit: reuse stored partial + scale
         }
 
-        // Write into the alternate buffer; the current one stays intact for restore.
-        final double[] values = partials[1 - currentIndex[r][nn]][r][nn];
+        // Every intermediate HMC evaluation writes the same proposal buffer. The
+        // node is rebuilt from its children, so its previous proposal value is not
+        // needed; the stored state must remain intact until accept/restore.
+        final int writeIndex = 1 - (stateStored ? storedCurrentIndex[r][nn] : currentIndex[r][nn]);
+        final double[] values = partials[writeIndex][r][nn];
         Arrays.fill(values, 1.0);
-        final boolean hasJump = psiRe != null;
+        final boolean hasJump = psi.hasJump;
         double scale = 0.0;
         for (int c = 0; c < childCount; c++) {
             final NodeRef child = tree.getChild(node, c);
@@ -609,13 +877,14 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
                 } else {
                     // Tip observation error enters HERE and nowhere else: only terminal branches
                     // carry it, and internal propagation is untouched.
-                    msg = hasJump ? kernel.leafKernelFromPsi(y, bl, psiRe, psiIm, sigma, jumpRate, sigmaEps)
-                                  : kernel.leafKernel(y, sigma, bl, sigmaEps);
+                    msg = hasJump
+                            ? kernel.leafKernelFromPsi(y, bl, psi.re(), psi.im(), sigma, jumpRate, sigmaEps)
+                            : kernel.leafKernel(y, sigma, bl, sigmaEps);
                 }
             } else {
                 final int cn = child.getNumber();
                 final double[] cv = partials[currentIndex[r][cn]][r][cn];
-                msg = hasJump ? kernel.propagateFromPsi(cv, bl, psiRe, psiIm)
+                msg = hasJump ? kernel.propagateFromPsi(cv, bl, psi.re(), psi.im())
                               : kernel.propagate(cv, sigma, bl);
                 scale += nodeLogScale[r][cn];   // carry the child's subtree scale
             }
@@ -630,7 +899,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
                 // a vanishing-probability proposal.
                 nodeLogScale[r][nn] = Double.NEGATIVE_INFINITY;
                 System.arraycopy(flatLeaf, 0, values, 0, n2);  // leave a defined (uniform) buffer,
-                currentIndex[r][nn] = 1 - currentIndex[r][nn]; // never a half-accumulated product
+                currentIndex[r][nn] = writeIndex; // never a half-accumulated product
                 return true;
             }
             final double inv = 1.0 / max;
@@ -638,7 +907,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             scale += Math.log(max);
         }
         nodeLogScale[r][nn] = scale;
-        currentIndex[r][nn] = 1 - currentIndex[r][nn];   // flip to the freshly written buffer
+        currentIndex[r][nn] = writeIndex;
         nodeRecomputes.incrementAndGet();
         return true;
     }
@@ -717,7 +986,12 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
                     : updateLandingNodePartial(r, child, sigma, lambda, sigmaEps);
         }
         if (!(changed || updateNode[nn] || residueDirty[r])) return false;
-        final double[] values = partials[1 - currentIndex[r][nn]][r][nn];
+        // Same buffer rule as updateNodePartial: while a state is stored (an HMC trajectory,
+        // its gradient/step-size checks, or a fullEvaluation check may evaluate several times
+        // before accept/restore) every write goes to the buffer that is NOT the stored one.
+        // For one evaluation per proposal this is the old 1 - currentIndex, so MH is unchanged.
+        final int writeIndex = 1 - (stateStored ? storedCurrentIndex[r][nn] : currentIndex[r][nn]);
+        final double[] values = partials[writeIndex][r][nn];
         Arrays.fill(values, 1.0);
         double scale = 0.0;
         for (int c = 0; c < tree.getChildCount(node); c++) {
@@ -725,7 +999,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             final int cn = child.getNumber();
             final double[] message;
             if (tree.isExternal(child)) {
-                final double[] theta = tipData[r][cn];
+                final double[] theta = landingTipData[r][cn];
                 message = theta == null ? flatLeaf : kernel.leafKernelLanding(theta, sigmaEps,
                         sigma, branchLength(child), lambda, landingGhatRe, landingGhatIm);
             } else {
@@ -771,14 +1045,14 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             scale += Math.log(max);
         }
         nodeLogScale[r][nn] = scale;
-        currentIndex[r][nn] = 1 - currentIndex[r][nn];
+        currentIndex[r][nn] = writeIndex;
         nodeRecomputes.incrementAndGet();
         return true;
     }
 
     private TorusLandingPruning.Result landingReference(int r, double[][] sigma,
                                                          double lambda, double[][] sigmaEps) {
-        return TorusLandingPruning.calculate(tree, this::branchLength, tipData[r], sigma,
+        return TorusLandingPruning.calculate(tree, this::branchLength, landingTipData[r], sigma,
                 lambda, jumpW, jumpD, jumpS, sigmaEps, Math.min(128, kernel.getGridSize()));
     }
 
@@ -865,7 +1139,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
                 if (Math.abs(a[rr][col]) > Math.abs(a[piv][col])) piv = rr;
             }
             if (Math.abs(a[piv][col]) < 1.0e-300) {
-                throw new RuntimeException("Singular precision matrix");
+                throw new ArithmeticException("Singular precision matrix");
             }
             final double[] tmp = a[col]; a[col] = a[piv]; a[piv] = tmp;
             final double diag = a[col][col];
@@ -969,6 +1243,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             System.arraycopy(currentIndex[r], 0, storedCurrentIndex[r], 0, nodeCount);
             System.arraycopy(nodeLogScale[r], 0, storedNodeLogScale[r], 0, nodeCount);
         }
+        stateStored = true;
     }
 
     protected void restoreState() {
@@ -992,9 +1267,10 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             System.arraycopy(storedNodeLogScale[r], 0, nodeLogScale[r], 0, nodeCount);
         }
         ancestorsDirty = true;          // reverted partials -> ancestral sample is stale
+        stateStored = false;
     }
 
-    protected void acceptState() { }
+    protected void acceptState() { stateStored = false; }
 
     // ====================== ancestral reconstruction (TreeTraitProvider) ======================
     // The spectral pruning marginalises internal states, so ancestral angles are recovered with a
