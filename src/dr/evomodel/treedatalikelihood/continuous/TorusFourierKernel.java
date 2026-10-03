@@ -1848,4 +1848,329 @@ public class TorusFourierKernel {
         addLatticeAtom(re, wrappedParent, sigma, t, -lambda * t, null);
         return auditLandingGrid(re, true);
     }
+
+    // ======================================================================================
+    // ---- Landing law: analytic forward-mode derivatives of the production FFT likelihood ----
+    // ======================================================================================
+    //
+    // Differentiates EXACTLY the finite-grid arithmetic of leafKernelLanding (7-argument),
+    // propagateLanding and rootIntegralLanding, which stay untouched: every value below is
+    // produced by calling the same private primitives (landingTipCoefficients, applyLanding,
+    // fftN, rootIntegralLanding) in the same order, so values are bit-identical to the
+    // likelihood's. The derivative spectra are computed from the PRE-damping coefficients and
+    // then applyLanding is run, unchanged, on the value arrays.
+    //
+    // FFT scaling: C[m] = FFT(v)[m] = (N/V) c(m); grid values are Re(IFFT(C)), IFFT includes 1/N.
+    // With s_m = 0.5 m' Sigma m (the local "a" of applyLanding), E_m = exp(-(lambda + s_m) t)
+    // and rho_m = landingResetMass(s_m, t, lambda), one landing branch maps
+    //     C'[m] = E_m C[m] + 1{m=0} sum_r rho_r Re(ghat_r C[r]),
+    // so for a direction p with dLam_p = d lambda / d theta_p and ds_{m,p} = 0.5 m' dSigma_p m,
+    //     dC'[m] = E_m dC[m] - t E_m (dLam_p + ds_{m,p}) C[m]
+    //     dC'[0] += sum_r [ rho_r Re(ghat_r dC[r]) + (drho/dlambda dLam_p + drho/ds ds_{r,p}) Re(ghat_r C[r]) ].
+    // Re() is kept exactly where the value path keeps it: tip spectra are not Hermitian on the
+    // Nyquist row, so Re(ghat C) is not the same as a symmetrised form.
+    //
+    // No audit counter, warning or other shared mutable state is written here: a gradient sweep
+    // is read-only with respect to the kernel, so residue gradients may run concurrently.
+
+    /**
+     * Residue-specific spectral data for a landing gradient sweep, built once per residue
+     * per gradient call by {@link #prepareLandingGradientContext}. Immutable after construction.
+     */
+    public static final class LandingGradientContext {
+        private final TorusFourierKernel owner;
+        private final double[][] sigma;
+        private final double lambda;
+        private final double[] ghatRe, ghatIm;     // references to the likelihood's read-only ghat
+        private final double[][] sigmaEps;
+        private final int parameters;
+        private final double[] a;                  // s_m = 0.5 m' Sigma m, same expression as applyLanding
+        private final double[][] da;               // [p][m] = 0.5 m' dSigma_p m
+        private final double[] dLam;               // [p] = d lambda / d theta_p
+        private final double[][] epsHalfQuad;      // [p][m] = 0.5 m' dSigmaEps_p m, null when no direction moves Sigma_eps
+
+        private LandingGradientContext(TorusFourierKernel owner, double[][] sigma, double lambda,
+                                       double[] ghatRe, double[] ghatIm, double[][] sigmaEps,
+                                       double[][][] dSigma, double[] dRate, double[][][] dSigmaEps) {
+            this.owner = owner;
+            this.sigma = sigma;
+            this.lambda = lambda;
+            this.ghatRe = ghatRe;
+            this.ghatIm = ghatIm;
+            this.sigmaEps = sigmaEps;
+            this.parameters = dRate.length;
+            final int size = owner.nTotal;
+            this.a = new double[size];
+            this.da = new double[parameters][size];
+            this.dLam = dRate.clone();
+            this.epsHalfQuad = dSigmaEps == null ? null : new double[parameters][size];
+            final double[] m = new double[owner.dim];
+            for (int idx = 0; idx < size; idx++) {
+                owner.modeOf(idx, m);
+                a[idx] = 0.5 * owner.quadForm(sigma, m);
+                for (int p = 0; p < parameters; p++) {
+                    da[p][idx] = 0.5 * owner.quadForm(dSigma[p], m);
+                    if (epsHalfQuad != null) epsHalfQuad[p][idx] = 0.5 * owner.quadForm(dSigmaEps[p], m);
+                }
+            }
+        }
+
+        public int getParameterCount() { return parameters; }
+
+        public double getJumpRate() { return lambda; }
+    }
+
+    /**
+     * Precompute the landing derivative data for one residue.
+     *
+     * @param sigma     diffusion covariance (the same object/values the likelihood propagates with)
+     * @param lambda    jump rate, read unclamped; must be finite and nonnegative
+     * @param ghatRe    landing characteristic function, real part (required even at lambda == 0,
+     *                  where the rate derivative is a right derivative that involves ghat)
+     * @param ghatIm    imaginary part
+     * @param dSigma    dSigma[p] = d Sigma / d theta_p
+     * @param dRate     dRate[p] = d lambda / d theta_p
+     * @param sigmaEps  tip observation-error covariance (positive definite; landing requires it)
+     * @param dSigmaEps dSigmaEps[p] = d Sigma_eps / d theta_p, or null when no parameter moves it
+     */
+    public LandingGradientContext prepareLandingGradientContext(double[][] sigma, double lambda,
+                                                                double[] ghatRe, double[] ghatIm,
+                                                                double[][][] dSigma, double[] dRate,
+                                                                double[][] sigmaEps, double[][][] dSigmaEps) {
+        requireLandingCovariance(sigma, "Diffusion covariance");
+        requireLandingRate(lambda);
+        requireLandingArray(ghatRe, nTotal, "ghatRe");
+        requireLandingArray(ghatIm, nTotal, "ghatIm");
+        requireLandingCovariance(sigmaEps, "Landing tip-error covariance");
+        if (dSigma == null || dRate == null || dSigma.length != dRate.length || dRate.length == 0)
+            throw new IllegalArgumentException("Covariance and rate directions must have equal nonzero length");
+        final double[][][] directions = new double[dRate.length][][];
+        for (int p = 0; p < dRate.length; p++) {
+            directions[p] = copyGradientMatrix(dSigma[p], "Covariance direction");
+            if (!Double.isFinite(dRate[p])) throw new IllegalArgumentException("Rate directions must be finite");
+        }
+        double[][][] epsDirections = null;
+        if (dSigmaEps != null) {
+            if (dSigmaEps.length != dRate.length)
+                throw new IllegalArgumentException("Tip-error directions must match the parameter count");
+            epsDirections = new double[dRate.length][][];
+            for (int p = 0; p < dRate.length; p++)
+                epsDirections[p] = copyGradientMatrix(dSigmaEps[p], "Tip-error direction");
+        }
+        return new LandingGradientContext(this, sigma, lambda, ghatRe, ghatIm, sigmaEps,
+                directions, dRate, epsDirections);
+    }
+
+    private void checkLandingGradientContext(LandingGradientContext context) {
+        if (context == null || context.owner != this)
+            throw new IllegalArgumentException("Landing gradient context belongs to a different grid");
+    }
+
+    /**
+     * psi(x) = (1 - e^{-x} - x e^{-x}) / x^2 for x >= 0, so that d rho / d s = -lambda t^2 psi(lambda t + s t).
+     * The direct form cancels catastrophically for small x (5e-5 relative error at x = 1e-12, which
+     * occurs on MIN_BRANCH terminal branches and at low modes), so below 0.1 the alternating series
+     * sum_{k=0..10} (-1)^k (k+1) x^k / (k+2)! is used; its truncation error there is below 2e-20.
+     */
+    public static double landingPsi(double x) {
+        if (x < 0.1) {
+            return 1.0 / 2.0 + x * (-1.0 / 3.0 + x * (1.0 / 8.0 + x * (-1.0 / 30.0 + x * (1.0 / 144.0
+                    + x * (-1.0 / 840.0 + x * (1.0 / 5760.0 + x * (-1.0 / 45360.0 + x * (1.0 / 403200.0
+                    + x * (-1.0 / 3991680.0 + x * (1.0 / 43545600.0))))))))));
+        }
+        if (x > 700.0) return 1.0 / (x * x);     // e^{-x}(1+x) < 1e-300: below one ulp of 1; also covers x = inf
+        return (-Math.expm1(-x) - x * Math.exp(-x)) / (x * x);
+    }
+
+    /**
+     * Derivatives of rho = landingResetMass(s, t, lambda) = lambda (1 - e^{-(lambda+s)t}) / (lambda+s):
+     * out[0] = d rho / d lambda, out[1] = d rho / d s. Not gated on lambda > 0: at lambda == 0 the
+     * right derivative d rho / d lambda = (1 - e^{-st})/s (t at s == 0) is nonzero.
+     * d rho / d lambda = (s g1 + lambda t E)/u with u = lambda + s, g1 = (1 - E)/u, E = e^{-ut}: all
+     * terms are nonnegative, so it never cancels.
+     */
+    public static void landingResetMassDerivatives(double s, double t, double lambda, double[] out) {
+        final double u = lambda + s;
+        if (u == 0.0) {
+            out[0] = t;
+            out[1] = 0.0;
+            return;
+        }
+        final double x = u * t;
+        final double e = Math.exp(-x);
+        final double g1 = -Math.expm1(-x) / u;
+        out[0] = (s * g1 + lambda * t * e) / u;
+        out[1] = lambda == 0.0 ? 0.0 : -lambda * t * t * landingPsi(x);
+    }
+
+    /**
+     * Forward derivative of applyLanding. re/im are the PRE-damping value coefficients (read only);
+     * gRe/gIm hold the input derivative spectra dC_p and are overwritten with dC'_p. Must be called
+     * BEFORE applyLanding modifies re/im in place.
+     */
+    private void applyLandingDerivative(double[] re, double[] im, double[][] gRe, double[][] gIm,
+                                        double t, LandingGradientContext ctx) {
+        final int parameters = ctx.parameters;
+        final double lambda = ctx.lambda;
+        final double[] correction = new double[parameters];
+        final double[] compensation = new double[parameters];
+        final double[] dRho = new double[2];
+        for (int idx = 0; idx < nTotal; idx++) {
+            final double a = ctx.a[idx];
+            final double damping = Math.exp(-(lambda + a) * t);       // identical to applyLanding
+            final double rho = landingResetMass(a, t, lambda);
+            landingResetMassDerivatives(a, t, lambda, dRho);
+            final double gr = ctx.ghatRe[idx], gi = ctx.ghatIm[idx];
+            final double cRe = re[idx], cIm = im[idx];
+            final double projection = gr * cRe - gi * cIm;            // Re(ghat C), as in applyLanding
+            for (int p = 0; p < parameters; p++) {
+                final double dl = ctx.dLam[p], ds = ctx.da[p][idx];
+                final double dRe = gRe[p][idx], dIm = gIm[p][idx];
+                final double term = rho * (gr * dRe - gi * dIm) + (dRho[0] * dl + dRho[1] * ds) * projection;
+                final double adjusted = term - compensation[p];
+                final double next = correction[p] + adjusted;
+                compensation[p] = (next - correction[p]) - adjusted;
+                correction[p] = next;
+                final double rate = t * (dl + ds);
+                gRe[p][idx] = damping * dRe - rate * damping * cRe;
+                gIm[p][idx] = damping * dIm - rate * damping * cIm;
+            }
+        }
+        for (int p = 0; p < parameters; p++) gRe[p][0] += correction[p];
+    }
+
+    private static void requireFiniteLandingGradient(double[] values, double[][] gradients) {
+        for (double v : values) {
+            if (!Double.isFinite(v)) throw new ArithmeticException("Non-finite landing Fourier grid value in gradient");
+        }
+        for (double[] g : gradients) for (double v : g) {
+            if (!Double.isFinite(v)) throw new ArithmeticException("Non-finite landing Fourier grid derivative");
+        }
+    }
+
+    /**
+     * Tip plus terminal branch (the 7-argument leafKernelLanding) with forward derivatives.
+     * Values are bit-identical to leafKernelLanding(theta, sigmaEps, sigma, t, lambda, ghatRe, ghatIm);
+     * unlike it, no audit counter is updated. Cost: 1 + P inverse FFTs.
+     */
+    public ValueGradient leafKernelLandingWithGradient(double[] theta, double t, LandingGradientContext ctx) {
+        checkLandingGradientContext(ctx);
+        requireLandingTime(t);
+        final int parameters = ctx.parameters;
+        final double[] re = new double[nTotal];
+        final double[] im = new double[nTotal];
+        landingTipCoefficients(theta, ctx.sigmaEps, re, im);
+        final double[][] gRe = new double[parameters][nTotal];
+        final double[][] gIm = new double[parameters][nTotal];
+        if (ctx.epsHalfQuad != null) {
+            // d/dtheta_p of scale exp(-1/2 m' Sigma_eps m) e^{-i m.y} = -1/2 m' dSigmaEps_p m * C_tip.
+            for (int p = 0; p < parameters; p++) {
+                for (int idx = 0; idx < nTotal; idx++) {
+                    gRe[p][idx] = -ctx.epsHalfQuad[p][idx] * re[idx];
+                    gIm[p][idx] = -ctx.epsHalfQuad[p][idx] * im[idx];
+                }
+            }
+        }
+        applyLandingDerivative(re, im, gRe, gIm, t, ctx);
+        applyLanding(re, im, ctx.sigma, t, ctx.lambda, ctx.ghatRe, ctx.ghatIm);
+        fftN(re, im, true);
+        for (int p = 0; p < parameters; p++) fftN(gRe[p], gIm[p], true);
+        requireFiniteLandingGradient(re, gRe);
+        return new ValueGradient(re, gRe);
+    }
+
+    /**
+     * propagateLanding with forward derivatives, including the input partial's derivatives.
+     * Values are bit-identical to propagateLanding(partial, sigma, t, lambda, ghatRe, ghatIm);
+     * no audit counter is updated. Cost: 1 + P forward and 1 + P inverse FFTs.
+     */
+    public ValueGradient propagateLandingWithGradient(double[] partial, double[][] partialGradients,
+                                                      double t, LandingGradientContext ctx) {
+        checkLandingGradientContext(ctx);
+        requireLandingArray(partial, nTotal, "partial");
+        requireLandingTime(t);
+        final int parameters = ctx.parameters;
+        if (partialGradients == null || partialGradients.length != parameters)
+            throw new IllegalArgumentException("Partial gradient dimensions disagree");
+        for (double[] g : partialGradients) requireLandingArray(g, nTotal, "partial gradient");
+        final double[] re = partial.clone();
+        final double[][] gRe = new double[parameters][];
+        for (int p = 0; p < parameters; p++) gRe[p] = partialGradients[p].clone();
+        if (t == 0.0) {                       // mirrors propagateLanding's shortcut
+            requireFiniteLandingGradient(re, gRe);
+            return new ValueGradient(re, gRe);
+        }
+        final double[] im = new double[nTotal];
+        fftN(re, im, false);
+        final double[][] gIm = new double[parameters][nTotal];
+        for (int p = 0; p < parameters; p++) fftN(gRe[p], gIm[p], false);
+        applyLandingDerivative(re, im, gRe, gIm, t, ctx);
+        applyLanding(re, im, ctx.sigma, t, ctx.lambda, ctx.ghatRe, ctx.ghatIm);
+        fftN(re, im, true);
+        for (int p = 0; p < parameters; p++) fftN(gRe[p], gIm[p], true);
+        requireFiniteLandingGradient(re, gRe);
+        return new ValueGradient(re, gRe);
+    }
+
+    /**
+     * Stationary landing root with derivatives: returns {R, dR_0, ..., dR_{P-1}} where R is
+     * rootIntegralLanding(values, ...) itself (so it is bit-identical to the likelihood's root)
+     * and dR_p = (1/N) sum_m [ w_m Re(ghat_m dC_p[m]) + (dw/dlambda dLam_p + dw/ds ds_{m,p}) Re(ghat_m C[m]) ].
+     * For lambda > 0, w = lambda/(lambda+s), with m = 0 set to w = 1, dw = 0 explicitly (avoids
+     * -1/lambda * 0 = NaN for subnormal lambda). At lambda == 0 (the grid-mean branch) w = delta_{m0}
+     * and the right derivative is dw/dlambda = 1/s_m for m != 0. The caller decides what a
+     * nonpositive R means.
+     */
+    public double[] rootIntegralLandingWithGradient(double[] values, double[][] gradients,
+                                                    LandingGradientContext ctx) {
+        checkLandingGradientContext(ctx);
+        final int parameters = ctx.parameters;
+        if (gradients == null || gradients.length != parameters)
+            throw new IllegalArgumentException("Partial gradient dimensions disagree");
+        for (double[] g : gradients) requireLandingArray(g, nTotal, "partial gradient");
+        final double[] out = new double[1 + parameters];
+        out[0] = rootIntegralLanding(values, ctx.sigma, ctx.lambda, ctx.ghatRe, ctx.ghatIm);
+        final double lambda = ctx.lambda;
+        final double[] re = values.clone();
+        final double[] im = new double[nTotal];
+        fftN(re, im, false);
+        final double[][] gRe = new double[parameters][];
+        final double[][] gIm = new double[parameters][nTotal];
+        for (int p = 0; p < parameters; p++) {
+            gRe[p] = gradients[p].clone();
+            fftN(gRe[p], gIm[p], false);
+        }
+        final double[] sum = new double[parameters];
+        final double[] compensation = new double[parameters];
+        for (int idx = 0; idx < nTotal; idx++) {
+            final double s = ctx.a[idx];
+            final double w, dwLambda, dwS;
+            if (idx == 0) {                       // mode m = 0: w = 1 for every lambda
+                w = 1.0;
+                dwLambda = 0.0;
+                dwS = 0.0;
+            } else if (lambda > 0.0) {
+                final double u = lambda + s;
+                w = lambda / u;
+                dwLambda = s / (u * u);
+                dwS = -lambda / (u * u);
+            } else {
+                w = 0.0;
+                dwLambda = 1.0 / s;
+                dwS = 0.0;
+            }
+            final double gr = ctx.ghatRe[idx], gi = ctx.ghatIm[idx];
+            final double projection = gr * re[idx] - gi * im[idx];
+            for (int p = 0; p < parameters; p++) {
+                final double term = w * (gr * gRe[p][idx] - gi * gIm[p][idx])
+                        + (dwLambda * ctx.dLam[p] + dwS * ctx.da[p][idx]) * projection;
+                final double adjusted = term - compensation[p];
+                final double next = sum[p] + adjusted;
+                compensation[p] = (next - sum[p]) - adjusted;
+                sum[p] = next;
+            }
+        }
+        for (int p = 0; p < parameters; p++) out[1 + p] = sum[p] / nTotal;
+        return out;
+    }
 }
