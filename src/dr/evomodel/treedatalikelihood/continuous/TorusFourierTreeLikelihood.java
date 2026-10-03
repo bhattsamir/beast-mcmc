@@ -86,6 +86,14 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
 
     /** Residue evaluations whose landing root integral was non-positive at this nGrid (returned -inf). */
     public long getLandingUndefinedEvaluations() { return landingUndefinedEvaluations.get(); }
+    // Landing GRADIENT sweeps that met the same non-positive root (they throw ArithmeticException,
+    // which BEAST's HMC operator turns into a rejected trajectory). Counted separately so the
+    // value-path audit above is never touched by a read-only gradient sweep.
+    private final java.util.concurrent.atomic.AtomicLong landingUndefinedGradients =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /** Landing gradient evaluations rejected because the root integral was non-positive at this nGrid. */
+    public long getLandingUndefinedGradients() { return landingUndefinedGradients.get(); }
     private final java.util.concurrent.atomic.AtomicBoolean landingResolutionWarning =
             new java.util.concurrent.atomic.AtomicBoolean();
     // Compound-Poisson jump, shared across residues: sampled rate lambda (jumpRate) and a FIXED
@@ -562,9 +570,25 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
      * This read-only sweep does not alter the likelihood/ancestral caches. The
      * rate derivative is residue-specific: a shared-rate sampler would need to
      * sum this component across residues.
+     *
+     * Under jumpLaw=landing the derivative is that of the landing FFT likelihood actually
+     * computed (stationary landing root, signed partials, max-|value| rescaling); where that
+     * likelihood is -inf (non-positive root integral at this nGrid) an ArithmeticException is
+     * thrown, so HMC rejects the trajectory -- the same truncated support MH samples.
      */
     public double[] getResidueGradient(int residue) {
         return residueGradient(residue, false);
+    }
+
+    /**
+     * Test/audit hook for jumpLaw=landing: {logL_r, d/dq1, d/dq2, d/drho, d/dlambda} from ONE
+     * read-only gradient sweep, where logL_r is assembled from the same kernel primitives in the
+     * same order as the likelihood, so it must equal this residue's cached log likelihood bit for
+     * bit. Throws ArithmeticException where the landing likelihood is -inf.
+     */
+    public double[] getLandingResidueGradientWithLogL(int residue) {
+        if (jumpLaw != JumpLaw.LANDING) throw new IllegalStateException("jumpLaw=landing only");
+        return residueGradient(residue, false, true);
     }
 
     /**
@@ -587,6 +611,10 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     }
 
     private double[] residueGradient(int residue, boolean tipError) {
+        return residueGradient(residue, tipError, false);
+    }
+
+    private double[] residueGradient(int residue, boolean tipError, boolean withLogL) {
         if (validateEveryEvaluation) {
             throw new IllegalStateException("Torus HMC gradients require torus.validate=false; "
                     + "they differentiate the FFT likelihood, not adaptive reference quadrature");
@@ -646,6 +674,9 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             dSigmaEps[4][0][0] = 1.0;                 // Sigma_eps = s*I  ->  d/ds = I
             dSigmaEps[4][1][1] = 1.0;
         }
+        if (jumpLaw == JumpLaw.LANDING) {
+            return landingResidueGradient(residue, sigma, dSigma, dRate, dSigmaEps, withLogL);
+        }
         TorusFourierKernel.GradientContext context = kernel.prepareGradientContext(
                 sigma, rate, jumpW, jumpD, jumpS,
                 dSigma, dRate, sigmaEpsilonMatrix(), dSigmaEps);
@@ -665,6 +696,140 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             }
         }
         return result;
+    }
+
+    /**
+     * Landing residue gradient: a READ-ONLY forward-mode sweep over the tree that mirrors
+     * calculateLandingLogLikelihood / updateLandingNodePartial step for step (same kernel
+     * primitives, same child order, same branch lengths, same whole-tip masking, same
+     * max-|value| division), then the stationary landing root. It writes no partial, buffer
+     * index, scale, cached residue logL, audit counter or warning, so it is safe between
+     * store and restore and concurrently across residues.
+     *
+     * The rate is read by the landing rule (unclamped): a negative or non-finite rate throws.
+     */
+    private double[] landingResidueGradient(int residue, double[][] sigma, double[][][] dSigma,
+                                            double[] dRate, double[][][] dSigmaEps, boolean withLogL) {
+        final double lambda = jumpRate.getParameterValue(jumpRate.getDimension() == 1 ? 0 : residue);
+        if (!Double.isFinite(lambda) || lambda < 0.0) {
+            throw new ArithmeticException("Invalid landing jump rate in torus gradient");
+        }
+        final TorusFourierKernel.LandingGradientContext context = kernel.prepareLandingGradientContext(
+                sigma, lambda, landingGhatRe, landingGhatIm, dSigma, dRate,
+                requireLandingObservationError(), dSigmaEps);
+        final LandingGradientPartial root = landingGradientPartial(residue, tree.getRoot(), context);
+        final double[] rootIntegral = kernel.rootIntegralLandingWithGradient(root.values, root.gradients, context);
+        final double rootMass = rootIntegral[0];
+        if (!(rootMass > 0.0) || !Double.isFinite(rootMass)) {
+            // The likelihood is -inf here (calculateLandingLogLikelihood's rule). There is no finite
+            // gradient to report; HMC turns this exception into a rejected trajectory.
+            landingUndefinedGradients.incrementAndGet();
+            throw new ArithmeticException("landing root integral non-positive in gradient");
+        }
+        final int parameters = context.getParameterCount();
+        final int offset = withLogL ? 1 : 0;
+        final double[] result = new double[parameters + offset];
+        if (withLogL) result[0] = root.logScale + Math.log(rootMass);
+        for (int p = 0; p < parameters; p++) {
+            final double value = root.logScaleGradient[p] + rootIntegral[1 + p] / rootMass;
+            if (!Double.isFinite(value)) throw new ArithmeticException("Nonfinite landing likelihood gradient");
+            result[offset + p] = value;
+        }
+        return result;
+    }
+
+    /** Values, derivative grids and the accumulated log scale (and its derivative) of one landing subtree. */
+    private static final class LandingGradientPartial {
+        final double[] values;
+        final double[][] gradients;
+        final double[] logScaleGradient;
+        double logScale;
+
+        LandingGradientPartial(int size, int parameters) {
+            values = new double[size];
+            Arrays.fill(values, 1.0);
+            gradients = new double[parameters][size];
+            logScaleGradient = new double[parameters];
+        }
+    }
+
+    /**
+     * Forward differentiation of updateLandingNodePartial. Per child: message (flat for a
+     * masked tip, zero derivative), product rule, then division by M = max_k |P[k]| with the
+     * gauge g_p = dP_p[k*]/P[k*] at the first index attaining M (signed: landing partials have
+     * negative lobes). The final gradient does not depend on the gauge; this choice keeps the
+     * derivative grids O(1). No floor of any kind is applied.
+     */
+    private LandingGradientPartial landingGradientPartial(int residue, NodeRef node,
+                                                          TorusFourierKernel.LandingGradientContext context) {
+        final int parameters = context.getParameterCount();
+        final int nn = node.getNumber();
+        final LandingGradientPartial partial = new LandingGradientPartial(n2, parameters);
+        final double[] values = partial.values;
+        final double[][] gradients = partial.gradients;
+        double scale = 0.0;
+        for (int c = 0; c < tree.getChildCount(node); c++) {
+            final NodeRef child = tree.getChild(node, c);
+            final int cn = child.getNumber();
+            final double[] message;
+            final double[][] messageGradients;
+            if (tree.isExternal(child)) {
+                final double[] theta = landingTipData[residue][cn];
+                if (theta == null) {
+                    message = flatLeaf;              // masked tip: flat message, zero derivative
+                    messageGradients = null;
+                } else {
+                    final TorusFourierKernel.ValueGradient leaf =
+                            kernel.leafKernelLandingWithGradient(theta, branchLength(child), context);
+                    message = leaf.values;
+                    messageGradients = leaf.gradients;
+                }
+            } else {
+                final LandingGradientPartial childPartial = landingGradientPartial(residue, child, context);
+                final TorusFourierKernel.ValueGradient propagated = kernel.propagateLandingWithGradient(
+                        childPartial.values, childPartial.gradients, branchLength(child), context);
+                message = propagated.values;
+                messageGradients = propagated.gradients;
+                scale += childPartial.logScale;
+                for (int p = 0; p < parameters; p++) partial.logScaleGradient[p] += childPartial.logScaleGradient[p];
+            }
+            double max = 0.0;
+            double peakAbs = -1.0;
+            int peak = 0;
+            for (int k = 0; k < n2; k++) {
+                final double previous = values[k];
+                if (messageGradients == null) {
+                    for (int p = 0; p < parameters; p++) gradients[p][k] = gradients[p][k] * message[k];
+                } else {
+                    for (int p = 0; p < parameters; p++) {
+                        gradients[p][k] = gradients[p][k] * message[k] + previous * messageGradients[p][k];
+                    }
+                }
+                values[k] *= message[k];
+                final double magnitude = Math.abs(values[k]);
+                max = Math.max(max, magnitude);                // exactly the value path's max
+                if (magnitude > peakAbs) {
+                    peakAbs = magnitude;
+                    peak = k;
+                }
+            }
+            if (!(max > 0.0) || !Double.isFinite(max)) {
+                throw new ArithmeticException("Invalid landing partial at residue " + residue + ", node " + nn
+                        + " in gradient evaluation, nGrid=" + kernel.getGridSize());
+            }
+            final double peakValue = values[peak];
+            for (int p = 0; p < parameters; p++) {
+                final double g = gradients[p][peak] / peakValue;
+                partial.logScaleGradient[p] += g;
+                for (int k = 0; k < n2; k++) {
+                    gradients[p][k] = gradients[p][k] / max - (values[k] / max) * g;
+                }
+            }
+            for (int k = 0; k < n2; k++) values[k] /= max;        // division, as the value path
+            scale += Math.log(max);
+        }
+        partial.logScale = scale;
+        return partial;
     }
 
     private static final class GradientPartial {
