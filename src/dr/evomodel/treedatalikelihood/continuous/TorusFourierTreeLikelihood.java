@@ -111,6 +111,11 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     private final double[][] nodeLogScale;             // [nResidues][nodeCount]
     private final int[][] storedCurrentIndex;
     private final double[][] storedNodeLogScale;
+    // A node's buffer index flips at most once between a store and the next store or restore,
+    // as in BufferIndexHelper. A second evaluation in the same cycle (MarkovChain's full-evaluation
+    // check, or any caller that evaluates twice) then rewrites the proposal's buffer in place
+    // instead of flipping back onto the stored one, which a later restore would hand back corrupted.
+    private final boolean[][] flipped;                 // [nResidues][nodeCount]
 
     // ---- dirty bookkeeping ----
     private final boolean[] updateNode;                // [nodeCount], shared across residues (tree/rate moves)
@@ -293,6 +298,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         this.nodeLogScale = new double[nResidues][nodeCount];
         this.storedCurrentIndex = new int[nResidues][nodeCount];
         this.storedNodeLogScale = new double[nResidues][nodeCount];
+        this.flipped = new boolean[nResidues][nodeCount];
 
         this.updateNode = new boolean[nodeCount];
         this.residueDirty = new boolean[nResidues];
@@ -593,8 +599,10 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             return false;   // cache hit: reuse stored partial + scale
         }
 
-        // Write into the alternate buffer; the current one stays intact for restore.
-        final double[] values = partials[1 - currentIndex[r][nn]][r][nn];
+        // Write into the alternate buffer; the current one stays intact for restore. Once a node
+        // has flipped in this cycle, its current buffer IS the alternate, so rewrite it in place.
+        final int target = flipped[r][nn] ? currentIndex[r][nn] : 1 - currentIndex[r][nn];
+        final double[] values = partials[target][r][nn];
         Arrays.fill(values, 1.0);
         final boolean hasJump = psiRe != null;
         double scale = 0.0;
@@ -630,7 +638,8 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
                 // a vanishing-probability proposal.
                 nodeLogScale[r][nn] = Double.NEGATIVE_INFINITY;
                 System.arraycopy(flatLeaf, 0, values, 0, n2);  // leave a defined (uniform) buffer,
-                currentIndex[r][nn] = 1 - currentIndex[r][nn]; // never a half-accumulated product
+                currentIndex[r][nn] = target;                  // never a half-accumulated product
+                flipped[r][nn] = true;
                 return true;
             }
             final double inv = 1.0 / max;
@@ -638,7 +647,8 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             scale += Math.log(max);
         }
         nodeLogScale[r][nn] = scale;
-        currentIndex[r][nn] = 1 - currentIndex[r][nn];   // flip to the freshly written buffer
+        currentIndex[r][nn] = target;   // point at the freshly written buffer
+        flipped[r][nn] = true;
         nodeRecomputes.incrementAndGet();
         return true;
     }
@@ -717,7 +727,8 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
                     : updateLandingNodePartial(r, child, sigma, lambda, sigmaEps);
         }
         if (!(changed || updateNode[nn] || residueDirty[r])) return false;
-        final double[] values = partials[1 - currentIndex[r][nn]][r][nn];
+        final int target = flipped[r][nn] ? currentIndex[r][nn] : 1 - currentIndex[r][nn];
+        final double[] values = partials[target][r][nn];
         Arrays.fill(values, 1.0);
         double scale = 0.0;
         for (int c = 0; c < tree.getChildCount(node); c++) {
@@ -771,7 +782,8 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             scale += Math.log(max);
         }
         nodeLogScale[r][nn] = scale;
-        currentIndex[r][nn] = 1 - currentIndex[r][nn];
+        currentIndex[r][nn] = target;
+        flipped[r][nn] = true;
         nodeRecomputes.incrementAndGet();
         return true;
     }
@@ -908,7 +920,14 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             // dr.evomodel.treedatalikelihood.TreeDataLikelihood, which only acts on
             // TreeChangedEvent.)
         } else if (model == branchRateModel) {
-            updateAllNodes();   // a rate change rescales every branch
+            // As TreeDataLikelihood: the index is the number of the node whose branch rate changed,
+            // -1 when every rate may have changed. A flagged node is recomputed together with the
+            // path above it, and its parent re-propagates the branch with the new rate.
+            if (index >= 0 && index < nodeCount) {
+                updateNode[index] = true;
+            } else {
+                updateAllNodes();
+            }
         } else {
             updateAllNodes();
         }
@@ -968,6 +987,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         for (int r = 0; r < nResidues; r++) {
             System.arraycopy(currentIndex[r], 0, storedCurrentIndex[r], 0, nodeCount);
             System.arraycopy(nodeLogScale[r], 0, storedNodeLogScale[r], 0, nodeCount);
+            Arrays.fill(flipped[r], false);
         }
     }
 
@@ -990,6 +1010,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         for (int r = 0; r < nResidues; r++) {
             System.arraycopy(storedCurrentIndex[r], 0, currentIndex[r], 0, nodeCount);
             System.arraycopy(storedNodeLogScale[r], 0, nodeLogScale[r], 0, nodeCount);
+            Arrays.fill(flipped[r], false);
         }
         ancestorsDirty = true;          // reverted partials -> ancestral sample is stale
     }
