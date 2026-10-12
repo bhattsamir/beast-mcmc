@@ -671,17 +671,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         boolean anyNodeDirty = false;
         for (boolean flag : updateNode) anyNodeDirty |= flag;
         final boolean nodesDirty = anyNodeDirty;
-        java.util.stream.IntStream stream = java.util.stream.IntStream.range(0, nResidues);
-        if (nResidues >= PARALLEL_THRESHOLD) stream = stream.parallel();
-        final Throwable[] failures = new Throwable[nResidues];
-        stream.forEach(r -> {
-            try {
-                shiftResidue(r, root, sigmaEps, nodesDirty, residueLogL);
-            } catch (RuntimeException | Error e) {
-                failures[r] = e;           // rethrown below, once every residue has stopped
-            }
-        });
-        rethrowFirst(failures);
+        forEachResidue(r -> shiftResidue(r, root, sigmaEps, nodesDirty, residueLogL));
         double total = 0.0;
         for (int r = 0; r < nResidues; r++) total += residueLogL[r];   // fixed-order, deterministic
         // Clear dirty flags only after the whole sweep has consumed them.
@@ -690,6 +680,27 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         System.arraycopy(branchLengths, 0, lastBranchLength, 0, nodeCount);
         ancestorsDirty = true;          // partials refreshed -> ancestral sample is stale
         return total;
+    }
+
+    /**
+     * Run body for every residue: in index order below PARALLEL_THRESHOLD, where the first exception
+     * stops the sweep as it always did, and as a parallel stream at or above it. In parallel, a
+     * residue's exception is held until every residue has stopped (see rethrowFirst).
+     */
+    private void forEachResidue(java.util.function.IntConsumer body) {
+        if (nResidues < PARALLEL_THRESHOLD) {
+            for (int r = 0; r < nResidues; r++) body.accept(r);
+            return;
+        }
+        final Throwable[] failures = new Throwable[nResidues];
+        java.util.stream.IntStream.range(0, nResidues).parallel().forEach(r -> {
+            try {
+                body.accept(r);
+            } catch (RuntimeException | Error e) {
+                failures[r] = e;           // rethrown below, once every residue has stopped
+            }
+        });
+        rethrowFirst(failures);
     }
 
     /**
@@ -1010,28 +1021,20 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         refreshTipCoefficients(sigmaEps);
         prepareBranches();
         final NodeRef root = tree.getRoot();
-        java.util.stream.IntStream stream = java.util.stream.IntStream.range(0, nResidues);
-        if (nResidues >= PARALLEL_THRESHOLD) stream = stream.parallel();
-        final Throwable[] failures = new Throwable[nResidues];
-        stream.forEach(r -> {
+        forEachResidue(r -> {
+            final double[][] sigma = invertPrecision(precisions.get(r));
+            final double lambda = jumpRate.getParameterValue(jumpRate.getDimension() == 1 ? 0 : r);
+            if (!Double.isFinite(lambda) || lambda < 0.0) {
+                throw new IllegalArgumentException("landing jumpRate must be finite and nonnegative");
+            }
+            double[][] scratch = sweepScratch.poll();
+            if (scratch == null) scratch = new double[4][n2];
             try {
-                final double[][] sigma = invertPrecision(precisions.get(r));
-                final double lambda = jumpRate.getParameterValue(jumpRate.getDimension() == 1 ? 0 : r);
-                if (!Double.isFinite(lambda) || lambda < 0.0) {
-                    throw new IllegalArgumentException("landing jumpRate must be finite and nonnegative");
-                }
-                double[][] scratch = sweepScratch.poll();
-                if (scratch == null) scratch = new double[4][n2];
-                try {
-                    landingResidue(r, root, sigma, lambda, sigmaEps, scratch);
-                } finally {
-                    sweepScratch.offer(scratch);
-                }
-            } catch (RuntimeException | Error e) {
-                failures[r] = e;           // rethrown below, once every residue has stopped
+                landingResidue(r, root, sigma, lambda, sigmaEps, scratch);
+            } finally {
+                sweepScratch.offer(scratch);
             }
         });
-        rethrowFirst(failures);
         double total = 0.0;
         for (int r = 0; r < nResidues; r++) total += acceptedResidueLogL[r];
         Arrays.fill(updateNode, false);

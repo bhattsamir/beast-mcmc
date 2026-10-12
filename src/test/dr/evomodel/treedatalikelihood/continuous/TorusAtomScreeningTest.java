@@ -255,7 +255,8 @@ public class TorusAtomScreeningTest extends TestCase {
                 case 4: y[0] = rng.nextBoolean() ? Double.POSITIVE_INFINITY : Double.NaN; break;
                 case 5: t = rng.nextBoolean() ? Double.POSITIVE_INFINITY : Double.NaN; break;
                 case 6: for (double[] row : sigma) for (int j = 0; j < dim; j++) row[j] *= 1e300; break;
-                default: break;                                                   // valid inputs
+                case 7: y[0] = (rng.nextBoolean() ? 1.0 : -1.0) * Math.pow(10.0, 305 + 3 * rng.nextDouble()); break;  // phase overflows
+                default: break;                                                   // valid inputs (kind 0)
             }
             double[] got = null, want = null;
             Throwable gotFailure = null, wantFailure = null;

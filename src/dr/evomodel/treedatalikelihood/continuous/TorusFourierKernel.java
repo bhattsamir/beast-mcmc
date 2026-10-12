@@ -367,21 +367,22 @@ public class TorusFourierKernel {
     }
 
     /**
-     * Whether leafKernelSplit's spectral half is exactly signed zeros for a Brownian tip: true when
-     * t and y are finite, every Brownian multiplier is finite (x - 1.0*x = +0.0) and so is every
-     * tip-error damping factor (0 * finite = +-0). A non-positive-definite Sigma or Sigma_eps can
-     * overflow them, and the spectral half is then NaN, which the shortcut must not hide.
+     * Whether leafKernelSplit's spectral half is exactly signed zeros for a Brownian tip: true when t
+     * is finite, every Brownian multiplier is finite (x - 1.0*x = +0.0), and so is every phase m.y
+     * (its cosine and sine then are) and every tip-error damping factor (0 * finite = +-0). A
+     * non-positive-definite Sigma or Sigma_eps, an overflowing form or a huge angle breaks this, and
+     * the spectral half is then NaN, which the shortcut must not hide.
      */
     private boolean brownianSpectralHalfVanishes(double[] y, double t, double[] bm, double[][] sigmaEps) {
         if (!Double.isFinite(t)) return false;
-        for (double v : y) if (!Double.isFinite(v)) return false;
         for (double v : bm) if (!Double.isFinite(v)) return false;
-        if (sigmaEps != null) {
-            final double[] m = new double[dim];
-            for (int idx = 0; idx < nTotal; idx++) {
-                for (int ax = 0; ax < dim; ax++) m[ax] = modeValue[ax][idx];
-                if (!Double.isFinite(Math.exp(-0.5 * quadForm(sigmaEps, m)))) return false;
-            }
+        final double[] m = new double[dim];
+        for (int idx = 0; idx < nTotal; idx++) {
+            for (int ax = 0; ax < dim; ax++) m[ax] = modeValue[ax][idx];
+            double phase = 0.0;                       // as leafKernelSplit forms it: cos and sin must be finite
+            for (int ax = 0; ax < dim; ax++) phase += m[ax] * y[ax];
+            if (!Double.isFinite(phase)) return false;
+            if (sigmaEps != null && !Double.isFinite(Math.exp(-0.5 * quadForm(sigmaEps, m)))) return false;
         }
         return true;
     }
