@@ -569,79 +569,116 @@ public class TorusFourierKernel {
         return last;   // last positive cell (never a zero-weight trailing cell at u->1)
     }
 
-    /** Sample a child cell ~ K_t(child - parent) * childPartial(child); u in [0,1). Falls back to
-     *  childPartial alone if the joint weight underflows everywhere. */
+    /** Sample a child cell ~ K_t(child - parent) * childPartial(child); u in [0,1). Returns -1
+     *  when the joint weight has no positive mass: substituting the unconditioned child partial
+     *  would draw from the wrong law (see testSmallSigmaInternalPropagation). */
     public int sampleConditionalCell(double[] kernelGrid, int parentIdx, double[] childPartial, double u) {
-        final int[] kp = new int[dim];
-        for (int ax = 0; ax < dim; ax++) kp[ax] = (parentIdx / stride[ax]) % nGrid;
-        final double[] w = new double[nTotal];
-        double tot = 0.0;
-        for (int idx = 0; idx < nTotal; idx++) {
-            int disp = 0;
-            for (int ax = 0; ax < dim; ax++) {
-                final int kc = (idx / stride[ax]) % nGrid;
-                int d = kc - kp[ax]; if (d < 0) d += nGrid;
-                disp += d * stride[ax];
-            }
-            double kv = kernelGrid[disp];
-            if (kv > 0.0 && childPartial[idx] > 0.0) { w[idx] = kv * childPartial[idx]; tot += w[idx]; }
-        }
-        if (!(tot > 0.0)) return sampleCell(childPartial, u);
-        final double target = u * tot;     // strict '>' so a zero-weight leading cell is never chosen
-        double c = 0.0;
-        int last = 0;
-        for (int idx = 0; idx < nTotal; idx++) {
-            if (w[idx] > 0.0) last = idx;
-            c += w[idx]; if (c > target) return idx;
-        }
-        return last;   // last positive-weight cell
+        return sampleChildCell(kernelGrid, null, parentIdx, childPartial, u);
     }
 
     /** Uniform/Haar-prior root integral of a grid partial = grid mean. */
 
-    // ============== landing ancestral sampling: FFT downward pass ==============
-    // The dense positive reference (TorusLandingPruning) builds a cells x cells transition
-    // matrix per edge, i.e. O(g^4) per edge. On the 225-taxon HA tree at nGrid 128 that is
-    // 6.0e10 operations per residue per logged state and the cost guard rejects it; at the
-    // grids where it does fit (<= 64 here) its quadrature does not converge. It is a
-    // small-tree validator, not a production sampler.
+    // ===================== ancestral sampling: split downward pass =====================
+    // Joint sampling of internal states from the cached upward partials, for BOTH jump laws.
+    // A child given its sampled parent CELL is drawn from p_t(child | parent) * childPartial.
+    // The transition is indexed by integer cell DISPLACEMENT (child - parent), the convention
+    // of the dense references, plus -- for landing only -- an absolute, parent-independent term:
     //
-    // This is the same conditional law evaluated with the FFT already used by the upward
-    // pass, O(g^2 log g) per edge -- about 1170x cheaper at nGrid 128. The maths is
-    // unchanged. For a landing branch of length t, given the PARENT angle x,
+    //   shift  : p_t = e^{-lambda t} WN(child - parent; t Sigma) + D_t(child - parent)
+    //   landing: p_t = e^{-lambda t} WN(child - parent; t Sigma) + (1 - e^{-lambda t}) r_t(child)
     //
-    //     p_t(y | x) = e^{-lambda t} K_{t Sigma}(y - x)  +  (1 - e^{-lambda t}) r_t(y),
+    // WHY A SPLIT. The zero-jump wrapped normal is narrower than a grid cell on short branches,
+    // where its TRUNCATED Fourier series rings: at nGrid 128 a pointwise FFT kernel put 1.5-3%
+    // of a child's mass two or more cells from the parent for t*Sigma in ~[1e-4, 1e-3] (exact:
+    // 1e-21..1e-7). The upward pass tolerates this because it INTEGRATES the kernel against a
+    // smooth partial; a sampler reads it POINTWISE. So, as for tips (leafKernelSplit), the
+    // zero-jump half is the exact wrapped normal in real space (branchDiffusionKernel, which also
+    // renormalises it to unit mass on the grid), and only the >=1-jump half -- which inherits the
+    // broad jump or basin covariances and is resolved by the grid -- stays on the FFT. That
+    // assumption is the one the tip split makes; its failure shows up as clipped negative mass
+    // (getAncestralClippedMass).
     //
-    // where K is the wrapped diffusion kernel and r_t -- the law of a point that jumped at
-    // some time in (0, t] and then diffused for the remaining time -- does NOT depend on x.
-    // So a draw is: flip a coin with P(jump) = 1 - e^{-lambda t}; on heads draw from
-    // r_t * subtreePartial, on tails from K_{t Sigma}(. - x) * subtreePartial. Both targets
-    // are a pointwise product of a grid density with the child's cached partial, so each is
-    // one inverse FFT plus a categorical draw over the grid.
+    // ORIENTATION. ghat(m) and e^{t psi(m)} are CHARACTERISTIC FUNCTIONS, E[exp(+i m.Z)]. As
+    // multipliers of FORWARD coefficients (upward pass) they are used as-is; as the
+    // coefficients of a DENSITY in the inverse-FFT basis exp(+i m.z) they are CONJUGATED.
+    // Omitting the conjugate reflects every directed component through the origin.
     //
-    // NEGATIVE TAILS. Fourier truncation can leave small negative cells. The likelihood
-    // integrates them harmlessly, but a sampler must normalise to a probability vector.
-    // Clipping silently changes the conditional, so instead the negative mass is measured
-    // and reported through the existing landing audit counters; the caller decides whether
-    // the grid is adequate. Cells are floored at zero ONLY after that accounting, and the
-    // floored mass is recorded so it can never pass unnoticed.
+    // DYNAMIC RANGE. Partials carry ~16 decades. A draw whose conditional mass sits on cells
+    // whose partial is below that floor is not determined by the available numerics (the J2
+    // regime, NUMERICS.md); such draws are counted (getAncestralUnresolvedDraws), never
+    // silently trusted.
 
-    /** Grid density of the no-jump branch kernel K_{t Sigma}, centred at the ORIGIN.
-     *  Shift to a parent cell with sampleConditionalCell, which indexes by integer cell
-     *  displacement -- the same convention the dense reference uses. Centring by a continuous
-     *  phase factor instead introduces a sub-cell offset that biases every sampled node. */
-    public double[] landingDiffusionKernel(double[][] sigma, double t) {
+    private final java.util.concurrent.atomic.DoubleAdder ancestralClippedMass =
+            new java.util.concurrent.atomic.DoubleAdder();
+    private final java.util.concurrent.atomic.AtomicLong ancestralUnresolvedDraws =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /** Total negative mass floored to zero while forming ancestral conditionals. */
+    public double getAncestralClippedMass() { return ancestralClippedMass.sum(); }
+
+    /** Ancestral draws whose conditional relied on partial values below the FFT's resolution
+     *  floor (more than 1e-6 of the mass on cells with |partial| < 1e-13 max|partial|). */
+    public long getAncestralUnresolvedDraws() { return ancestralUnresolvedDraws.get(); }
+
+    public void resetAncestralDiagnostics() {
+        ancestralClippedMass.reset();
+        ancestralUnresolvedDraws.set(0L);
+    }
+
+    /**
+     * Zero-jump branch kernel WN(z; t Sigma) on the grid, centred at the ORIGIN (index =
+     * displacement): the EXACT wrapped normal at the grid points (winding sum, never a truncated
+     * Fourier series), RENORMALISED to unit mass on the grid.
+     *
+     * Why renormalise: when t Sigma is narrower than a cell, point values do not conserve
+     * probability -- their Riemann sum is 1 + 2 sum_n exp(-v (n nGrid)^2 / 2) per axis, 1.17 at
+     * t Sigma = 3e-4, nGrid 128 -- which would over-weight "no jump" against the jump half by up
+     * to 17%. The FFT upward pass conserves mass exactly, so the sampler must too. For resolved
+     * kernels the factor is 1 to machine precision; for sub-cell kernels the child falls in the
+     * parent's cell, which is the correct limit at grid resolution. Validated against the exact
+     * continuous posterior quantised to cells (ancestral_continuous_truth.py): P(child within two
+     * cells) to 1e-4, where unnormalised point values miss by 6e-3 and a truncated series by 2e-2.
+     */
+    public double[] branchDiffusionKernel(double[][] sigma, double t) {
         requireLandingCovariance(sigma, "Diffusion covariance");
         requireLandingTime(t);
-        final double[] re = new double[nTotal];
-        final double[] im = new double[nTotal];
-        final double[] m = new double[dim];
+        final double[] out = new double[nTotal];
+        addLatticeAtom(out, new double[dim], sigma, t, 0.0, null);
+        double mass = 0.0;
+        for (double v : out) mass += v;
+        mass *= volume / nTotal;                           // cell volume (2 pi / nGrid)^dim
+        if (!(mass > 0.0) || Double.isInfinite(mass)) {
+            throw new ArithmeticException("zero-jump branch kernel has no representable mass at nGrid="
+                    + nGrid + " for t=" + t);
+        }
+        for (int k = 0; k < nTotal; k++) out[k] /= mass;
+        return out;
+    }
+
+    /**
+     * SHIFT >=1-jump kernel D_t(z), centred at the origin: the inverse FFT of
+     * conj(e^{t psi(m)} - e^{-lambda t} e^{-t m'Sigma m/2}), floored at zero with the floored
+     * mass recorded. Returns null for pure Brownian motion (psiRe == null or jumpRate <= 0).
+     */
+    public double[] shiftJumpKernel(double[][] sigma, double t, double jumpRate,
+                                    double[] psiRe, double[] psiIm) {
+        requireLandingCovariance(sigma, "Diffusion covariance");
+        requireLandingTime(t);
+        if (psiRe == null || !(jumpRate > 0.0)) return null;
+        final double[] mRe = new double[nTotal], mIm = new double[nTotal];
+        multiplierFromPsi(t, psiRe, psiIm, mRe, mIm);
+        final double[] bm = transferMultiplier(sigma, t, 0.0, null);
+        final double weight = Math.exp(-jumpRate * t);
         final double scale = (double) nTotal / volume;
-        for (int idx = 0; idx < nTotal; idx++) {
-            modeOf(idx, m);
-            re[idx] = scale * Math.exp(-quadForm(sigma, m) * 0.5 * t);
+        final double[] re = new double[nTotal], im = new double[nTotal];
+        for (int k = 0; k < nTotal; k++) {
+            re[k] = scale * (mRe[k] - weight * bm[k]);   // conj: real part unchanged
+            im[k] = -scale * mIm[k];                      //       imaginary part negated
         }
         fftN(re, im, true);
+        double negative = 0.0;
+        for (int k = 0; k < nTotal; k++) if (re[k] < 0.0) { negative -= re[k]; re[k] = 0.0; }
+        if (negative > 0.0) ancestralClippedMass.add(negative);
         return re;
     }
 
@@ -684,96 +721,66 @@ public class TorusFourierKernel {
 
     /**
      * Sample one grid cell from (density * partial), returning its flat index, or -1 when the
-     * product carries no positive mass. Negative cells are accounted through the landing audit
-     * counters and then floored; `uniform` is the caller's U(0,1) draw.
+     * product carries no positive mass. Used for the ROOT, whose density is absolute.
      */
     public int sampleFromProduct(double[] density, double[] partial, double uniform) {
         requireLandingArray(density, nTotal, "density");
-        requireLandingArray(partial, nTotal, "partial");
-        double total = 0.0, negativeMass = 0.0;
-        long nonpositive = 0, negative = 0;
-        final double[] weights = new double[nTotal];
-        for (int k = 0; k < nTotal; k++) {
-            final double v = density[k] * partial[k];
-            if (!(v > 0.0)) {
-                nonpositive++;
-                if (v < 0.0) { negative++; negativeMass -= v; }
-                weights[k] = 0.0;
-            } else {
-                weights[k] = v;
-                total += v;
-            }
-        }
-        landingDensityNonpositiveCount.addAndGet(nonpositive);
-        landingDensityNegativeCount.addAndGet(negative);
-        if (negativeMass > 0.0) landingNegativeMass.add(negativeMass);
-        if (!(total > 0.0) || !isFinite(total)) return -1;
-        double target = uniform * total;
-        for (int k = 0; k < nTotal; k++) {
-            target -= weights[k];
-            if (target <= 0.0) return k;
-        }
-        return nTotal - 1;
+        return sampleChildCell(null, density, 0, partial, uniform);
     }
 
     /**
-     * Sample a child cell from the landing conditional given the parent CELL.
-     *
-     *   p_t(child | parent) propto [ e^{-lambda t} K_{t Sigma}(child - parent)
-     *                                + (1 - e^{-lambda t}) r_t(child) ] * childPartial(child)
-     *
-     * The no-jump term depends on the integer cell DISPLACEMENT (child - parent), exactly as
-     * the dense reference indexes it; the reset term is absolute, independent of the parent.
-     * Mixing them in displacement space is what makes this agree with the dense sampler.
-     *
-     * Negative Fourier tail cells are counted through the landing audit before being floored,
-     * so truncation is recorded rather than silently absorbed. Returns -1 when no positive
-     * mass remains.
+     * Sample a child cell given its parent CELL from
+     *     [ displacementKernel[child - parent] + absoluteDensity[child] ] * childPartial[child],
+     * either term may be null. Callers pre-weight the terms (shift: e^{-lambda t} WN + D_t as
+     * one displacement kernel; landing: e^{-lambda t} WN as displacement, (1 - e^{-lambda t})
+     * r_t as absolute). Negative products are floored with their mass recorded; a draw whose
+     * mass relies on unresolved partial cells is counted. Returns -1 when no positive mass
+     * remains.
      */
-    public int sampleLandingChildCell(double[] diffusionKernel, double[] resetDensity,
-                                      double noJumpProbability, int parentIdx,
-                                      double[] childPartial, double u) {
-        requireLandingArray(diffusionKernel, nTotal, "diffusionKernel");
+    public int sampleChildCell(double[] displacementKernel, double[] absoluteDensity,
+                               int parentIdx, double[] childPartial, double u) {
+        if (displacementKernel != null) requireLandingArray(displacementKernel, nTotal, "displacementKernel");
+        if (absoluteDensity != null) requireLandingArray(absoluteDensity, nTotal, "absoluteDensity");
         requireLandingArray(childPartial, nTotal, "childPartial");
-        if (resetDensity != null) requireLandingArray(resetDensity, nTotal, "resetDensity");
-        final double jumpProbability = 1.0 - noJumpProbability;
         final int[] kp = new int[dim];
         for (int ax = 0; ax < dim; ax++) kp[ax] = (parentIdx / stride[ax]) % nGrid;
+        double maxAbs = 0.0;
+        for (int k = 0; k < nTotal; k++) maxAbs = Math.max(maxAbs, Math.abs(childPartial[k]));
+        final double floor = 1.0e-13 * maxAbs;
 
         final double[] w = new double[nTotal];
-        double total = 0.0, negativeMass = 0.0;
-        long nonpositive = 0, negative = 0;
+        double total = 0.0, negativeMass = 0.0, unresolved = 0.0;
         for (int idx = 0; idx < nTotal; idx++) {
-            int disp = 0;
-            for (int ax = 0; ax < dim; ax++) {
-                final int kc = (idx / stride[ax]) % nGrid;
-                int d = kc - kp[ax];
-                if (d < 0) d += nGrid;
-                disp += d * stride[ax];
+            double density = absoluteDensity == null ? 0.0 : absoluteDensity[idx];
+            if (displacementKernel != null) {
+                int disp = 0;
+                for (int ax = 0; ax < dim; ax++) {
+                    int d = (idx / stride[ax]) % nGrid - kp[ax];
+                    if (d < 0) d += nGrid;
+                    disp += d * stride[ax];
+                }
+                density += displacementKernel[disp];
             }
-            double density = noJumpProbability * diffusionKernel[disp];
-            if (resetDensity != null) density += jumpProbability * resetDensity[idx];
             final double v = density * childPartial[idx];
-            if (!(v > 0.0)) {
-                nonpositive++;
-                if (v < 0.0) { negative++; negativeMass -= v; }
-            } else {
+            if (v > 0.0) {
                 w[idx] = v;
                 total += v;
+                if (Math.abs(childPartial[idx]) < floor) unresolved += v;
+            } else if (v < 0.0) {
+                negativeMass -= v;
             }
         }
-        landingDensityNonpositiveCount.addAndGet(nonpositive);
-        landingDensityNegativeCount.addAndGet(negative);
-        if (negativeMass > 0.0) landingNegativeMass.add(negativeMass);
+        if (negativeMass > 0.0) ancestralClippedMass.add(negativeMass);
         if (!(total > 0.0) || Double.isNaN(total) || Double.isInfinite(total)) return -1;
+        if (unresolved > 1.0e-6 * total) ancestralUnresolvedDraws.incrementAndGet();
 
         final double target = u * total;
         double c = 0.0;
-        int last = 0;
+        int last = -1;
         for (int idx = 0; idx < nTotal; idx++) {
             if (w[idx] > 0.0) { last = idx; c += w[idx]; if (c > target) return idx; }
         }
-        return last;
+        return last;                                       // u at 1 - ulp: last positive cell
     }
 
     /** Angles at grid cell `idx`. Delegates to cellToAngles so there is ONE convention:

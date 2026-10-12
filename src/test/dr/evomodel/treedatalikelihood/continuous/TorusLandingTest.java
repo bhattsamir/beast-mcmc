@@ -250,6 +250,53 @@ public class TorusLandingTest extends TestCase {
         assertEquals(Double.doubleToLongBits(changed), Double.doubleToLongBits(like.getLogLikelihood()));
     }
 
+    /**
+     * A parameter value at which the landing root integral is non-positive on this grid is
+     * UNDEFINED there. By default the likelihood returns -inf so an MCMC proposal into that
+     * region is rejected (as the shift path does for an unusable FFT state), and the event is
+     * counted; it must not throw and kill the chain. Strict auditing still throws.
+     */
+    public void testUndefinedRootIntegralIsRejectedNotThrownUnlessStrict() throws Exception {
+        final String previous = System.getProperty("torus.landing.strict");
+        try {
+            System.clearProperty("torus.landing.strict");
+            TorusFourierTreeLikelihood lenient = undefinedRootLikelihood();
+            assertEquals(Double.NEGATIVE_INFINITY, lenient.getLogLikelihood());
+            assertEquals(1L, lenient.getLandingUndefinedEvaluations());
+
+            System.setProperty("torus.landing.strict", "true");
+            TorusFourierTreeLikelihood strict = undefinedRootLikelihood();
+            try {
+                strict.getLogLikelihood();
+                fail("strict auditing must reject an undefined landing root integral");
+            } catch (ArithmeticException expected) {
+                // strict auditing rejects at the first under-resolved message, before the root
+                assertTrue(expected.getMessage(), expected.getMessage().contains("Invalid landing root integral")
+                        || expected.getMessage().contains("Under-resolved landing branch"));
+            }
+        } finally {
+            if (previous == null) System.clearProperty("torus.landing.strict");
+            else System.setProperty("torus.landing.strict", previous);
+        }
+    }
+
+    /** Found by search: nGrid 8 cannot represent this tree's partials, so the root mass rings negative. */
+    private static TorusFourierTreeLikelihood undefinedRootLikelihood() throws Exception {
+        Tree tree = tree("((A:0.001,B:0.001):0.001,C:0.002);");
+        double[][] tips = {{0.0, 0.0}, {1.5, -1.0}, {-2.0, 2.5}};
+        double[][][] data = new double[1][tree.getExternalNodeCount()][];
+        for (int e = 0; e < tree.getExternalNodeCount(); e++) {
+            data[0][tree.getExternalNode(e).getNumber()] = tips["ABC".indexOf(tree.getNodeTaxon(tree.getExternalNode(e)).getId())];
+        }
+        List<MatrixParameter> precision = new ArrayList<MatrixParameter>();
+        precision.add(new MatrixParameter("undefinedPrecision", new Parameter[]{
+                new Parameter.Default(new double[]{1.0e5, 0.0}), new Parameter.Default(new double[]{0.0, 1.0e5})}));
+        return new TorusFourierTreeLikelihood("undefinedRoot", tree, null, precision, data,
+                new TorusFourierKernel(2, 8), new Parameter.Default(1.0e-3), new double[]{1.0},
+                new double[][]{{0.5, 0.5}}, new double[][][]{{{0.2, 0.0}, {0.0, 0.2}}},
+                new Parameter.Default(1.0e-4), JumpLaw.LANDING);
+    }
+
     public void testUnderResolvedLandingBranchFailsExplicitly() throws Exception {
         final String previous = System.getProperty("torus.landing.strict");
         System.setProperty("torus.landing.strict", "true");
