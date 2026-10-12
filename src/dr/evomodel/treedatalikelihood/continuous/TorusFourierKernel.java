@@ -155,7 +155,13 @@ public class TorusFourierKernel {
         }
     }
 
-    /** four1 on the contiguous line re/im[base .. base + nGrid). */
+    /**
+     * four1 on the contiguous line re/im[base .. base + nGrid). Stages are taken two at a time:
+     * the stages of half-span h and 2h map each set {q, q+h, q+2h, q+3h} (q < h, within a group of
+     * 4h) onto itself, so both are applied to a set before moving on, with each element receiving
+     * the same butterflies, in the same order, as in the stage-by-stage loop. A last unpaired stage
+     * runs on its own.
+     */
     private void fftLine(double[] re, double[] im, int base, double[] wRe, double[] wIm) {
         for (int k = 0; k < swapLow.length; k++) {
             final int a = base + swapLow[k], b = base + swapHigh[k];
@@ -167,19 +173,67 @@ public class TorusFourierKernel {
             im[b] = ti;
         }
         final int end = base + nGrid;
-        for (int half = 1; half < nGrid; half <<= 1) {
-            final int step = half << 1;
-            for (int q = 0; q < half; q++) {
-                final double wr = wRe[half - 1 + q], wi = wIm[half - 1 + q];
-                for (int p = base + q; p < end; p += step) {
-                    final int p2 = p + half;
-                    final double tempr = wr * re[p2] - wi * im[p2];
-                    final double tempi = wr * im[p2] + wi * re[p2];
-                    re[p2] = re[p] - tempr;
-                    im[p2] = im[p] - tempi;
-                    re[p] += tempr;
-                    im[p] += tempi;
+        int half = 1;
+        while (half < nGrid) {
+            if ((half << 1) < nGrid) {
+                final int h = half, h2 = half << 1, group = half << 2;
+                for (int q = 0; q < h; q++) {
+                    final double w1r = wRe[h - 1 + q], w1i = wIm[h - 1 + q];        // stage h, both pairs
+                    final double w2r = wRe[h2 - 1 + q], w2i = wIm[h2 - 1 + q];      // stage 2h, pair (q, q+2h)
+                    final double w3r = wRe[h2 - 1 + q + h], w3i = wIm[h2 - 1 + q + h];  // stage 2h, (q+h, q+3h)
+                    for (int x0 = base + q; x0 < end; x0 += group) {
+                        final int x1 = x0 + h, x2 = x0 + h2, x3 = x2 + h;
+                        double r0 = re[x0], i0 = im[x0], r1 = re[x1], i1 = im[x1];
+                        double r2 = re[x2], i2 = im[x2], r3 = re[x3], i3 = im[x3];
+                        double tempr = w1r * r1 - w1i * i1, tempi = w1r * i1 + w1i * r1;
+                        r1 = r0 - tempr;
+                        i1 = i0 - tempi;
+                        r0 += tempr;
+                        i0 += tempi;
+                        tempr = w1r * r3 - w1i * i3;
+                        tempi = w1r * i3 + w1i * r3;
+                        r3 = r2 - tempr;
+                        i3 = i2 - tempi;
+                        r2 += tempr;
+                        i2 += tempi;
+                        tempr = w2r * r2 - w2i * i2;
+                        tempi = w2r * i2 + w2i * r2;
+                        r2 = r0 - tempr;
+                        i2 = i0 - tempi;
+                        r0 += tempr;
+                        i0 += tempi;
+                        tempr = w3r * r3 - w3i * i3;
+                        tempi = w3r * i3 + w3i * r3;
+                        r3 = r1 - tempr;
+                        i3 = i1 - tempi;
+                        r1 += tempr;
+                        i1 += tempi;
+                        re[x0] = r0;
+                        im[x0] = i0;
+                        re[x1] = r1;
+                        im[x1] = i1;
+                        re[x2] = r2;
+                        im[x2] = i2;
+                        re[x3] = r3;
+                        im[x3] = i3;
+                    }
                 }
+                half <<= 2;
+            } else {
+                final int step = half << 1;
+                for (int q = 0; q < half; q++) {
+                    final double wr = wRe[half - 1 + q], wi = wIm[half - 1 + q];
+                    for (int p = base + q; p < end; p += step) {
+                        final int p2 = p + half;
+                        final double tempr = wr * re[p2] - wi * im[p2];
+                        final double tempi = wr * im[p2] + wi * re[p2];
+                        re[p2] = re[p] - tempr;
+                        im[p2] = im[p] - tempi;
+                        re[p] += tempr;
+                        im[p] += tempi;
+                    }
+                }
+                half <<= 1;
             }
         }
     }
