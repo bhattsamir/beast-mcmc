@@ -91,6 +91,12 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     private final double[] jumpW;      // mixture weights, length K
     private final double[][] jumpD;    // displacements, K x dim
     private final double[][][] jumpS;  // covariances, K x dim x dim
+    // Shift law: the mixture's characteristic function phi(m), fixed for the run because the
+    // mixture is (the parser copies it once), so psi is built from it per residue instead of
+    // re-summing the mixture at every mode. Null when there is no complete mixture. If the mixture
+    // ever becomes a sampled parameter this table must be rebuilt when it changes.
+    private final double[] jumpPhiRe;
+    private final double[] jumpPhiIm;
     private final int nResidues;
     private final int n2;
     private final int dim;
@@ -275,6 +281,14 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         } else {
             this.landingGhatRe = null;
             this.landingGhatIm = null;
+        }
+        if (jumpLaw == JumpLaw.SHIFT && jumpW != null && jumpD != null && jumpS != null) {
+            this.jumpPhiRe = new double[n2];
+            this.jumpPhiIm = new double[n2];
+            kernel.computeJumpCharacteristic(jumpW, jumpD, jumpS, jumpPhiRe, jumpPhiIm);
+        } else {
+            this.jumpPhiRe = null;
+            this.jumpPhiIm = null;
         }
         this.nodeCount = tree.getNodeCount();
         this.landingNonpositiveByBranch = jumpLaw == JumpLaw.LANDING ? new long[nResidues][nodeCount] : null;
@@ -577,16 +591,29 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         // Sigma_eps is shared by all residues and constant across the sweep; resolve it once.
         final double[][] sigmaEps = sigmaEpsilonMatrix();
         final double[] residueLogL = new double[nResidues];
+        boolean anyNodeDirty = false;
+        for (boolean flag : updateNode) anyNodeDirty |= flag;
+        final boolean nodesDirty = anyNodeDirty;
         java.util.stream.IntStream stream = java.util.stream.IntStream.range(0, nResidues);
         if (nResidues >= PARALLEL_THRESHOLD) stream = stream.parallel();
         stream.forEach(r -> {
             final double[][] sigma = invertPrecision(precisions.get(r));
             final double jr = jumpRateValue(r);
+            // Nothing flagged and this residue unchanged: every node would be a cache hit, so the
+            // accepted value stands. Skip it before building its jump exponent.
+            if (!nodesDirty && !residueDirty[r] && !Double.isNaN(acceptedResidueLogL[r])) {
+                residueLogL[r] = acceptedResidueLogL[r];
+                return;
+            }
             double[] psiRe = null, psiIm = null;
             if (jr > 0.0 && jumpS != null) {     // precompute the branch-independent jump exponent once per residue
                 psiRe = new double[n2];
                 psiIm = new double[n2];
-                kernel.computePsiComplex(sigma, jr, jumpW, jumpD, jumpS, psiRe, psiIm);
+                if (jumpPhiRe != null) {
+                    kernel.computePsiFromCharacteristic(sigma, jr, jumpPhiRe, jumpPhiIm, psiRe, psiIm);
+                } else {
+                    kernel.computePsiComplex(sigma, jr, jumpW, jumpD, jumpS, psiRe, psiIm);
+                }
             }
             boolean changed = updateNodePartial(r, root, sigma, psiRe, psiIm, jr, sigmaEps);
             if (changed || Double.isNaN(acceptedResidueLogL[r])) {

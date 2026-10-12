@@ -91,14 +91,17 @@ public class TorusFourierKernel {
         for (int direction = 0; direction < 2; direction++) {
             fillTwiddles(direction == 1, twiddleRe[direction], twiddleIm[direction]);
         }
-        // Mode vectors as modeOf computes them, and the index of -m (see mirrorIndex).
+        // Mode vectors as modeOf computes them, grid angles as angleOf computes them, and the index
+        // of -m (see mirrorIndex).
         this.modeValue = new double[dim][nTotal];
+        this.angleValue = new double[dim][nTotal];
         this.mirrorIndex = new int[nTotal];
         for (int idx = 0; idx < nTotal; idx++) {
             int mirror = 0;
             for (int ax = 0; ax < dim; ax++) {
                 final int i = (idx / stride[ax]) % nGrid;
                 modeValue[ax][idx] = freq[i];
+                angleValue[ax][idx] = angleOf(idx, ax);
                 if (mirror >= 0) mirror = i == nGrid / 2 ? -1 : mirror + ((nGrid - i) % nGrid) * stride[ax];
             }
             mirrorIndex[idx] = mirror;
@@ -114,6 +117,7 @@ public class TorusFourierKernel {
     // branch operator evaluates its exponentials once per mirror pair. LandingTables verifies the
     // equality on its own values before relying on it.
     private final double[][] modeValue;
+    private final double[][] angleValue;        // [ax][idx] = angleOf(idx, ax)
     private final int[] mirrorIndex;
 
     // ---- planned FFT ----
@@ -303,7 +307,7 @@ public class TorusFourierKernel {
         final double[] out = new double[nTotal];
         final double[] m = new double[dim];
         for (int idx = 0; idx < nTotal; idx++) {
-            modeOf(idx, m);
+            for (int ax = 0; ax < dim; ax++) m[ax] = modeValue[ax][idx];
             double psi = -0.5 * quadForm(sigma, m);
             if (hasJump) psi += jumpRate * (Math.exp(-0.5 * quadForm(sigmaJump, m)) - 1.0);
             out[idx] = Math.exp(t * psi);
@@ -347,8 +351,15 @@ public class TorusFourierKernel {
      * bit-for-bit the original arithmetic.
      */
     public double[] leafKernel(double[] y, double[][] sigma, double t, double[][] sigmaEps) {
-        return leafKernelSplit(y, sigma, t, 0.0,
-                               transferMultiplier(sigma, t, 0.0, null), null, sigmaEps);
+        // Without jumps the spectral half of leafKernelSplit is identically zero: its multiplier is
+        // the Brownian one minus itself (weight e^{-0 t} = 1), so the inverse FFT returns signed
+        // zeros, which the clamp keeps and the atom then overwrites exactly as it would a plain zero.
+        // Start from zeros and add the atom directly; the result is the same to the last bit.
+        final double lamT = 0.0 * t;
+        final double[] re = new double[nTotal];
+        addLatticeAtom(re, y, sigma, t, -lamT, sigmaEps);
+        for (int k = 0; k < nTotal; k++) if (re[k] < MIN_POS) re[k] = MIN_POS;
+        return re;
     }
 
 
@@ -435,17 +446,65 @@ public class TorusFourierKernel {
         int combos = 1;
         for (int i = 0; i < dim; i++) combos *= span;
         final double logNorm = logWeight - 0.5 * (dim * Math.log(TWO_PI) + logDet);
+        // SCREENING. Every image's term is exp(-(q_c - q_min)/2), and an image with q_c - q_min > 1500
+        // contributes exp(< -750) = 0.0 exactly, so adding it changes nothing. Such images are found
+        // without forming their quadratic forms, from the expansion
+        //     q(b + s) = q(b) + s'(A + A')b + s'As,     b = grid angle - y, s = 2 pi k, A = inv,
+        // whose first term is the same for every image: an image is skipped when its screened value
+        // exceeds the smallest by more than SCREEN_GAP plus a bound on the rounding of both the screen
+        // and the direct form (a relative 1e-12 of sum|A_ij| * reach^2, thousands of times the
+        // worst-case rounding). Every other image is evaluated exactly as before, in the same order,
+        // so the result is unchanged to the last bit. Non-finite values never pass the test.
+        final double[][] shift = new double[combos][dim];
+        final double[] shiftForm = new double[combos];
+        double maxAbsY = 0.0;
+        for (int ax = 0; ax < dim; ax++) maxAbsY = Math.max(maxAbsY, Math.abs(y[ax]));
+        double invSum = 0.0;
+        final double[][] sym = new double[dim][dim];
+        for (int i = 0; i < dim; i++) {
+            for (int j = 0; j < dim; j++) {
+                invSum += Math.abs(inv[i][j]);
+                sym[i][j] = inv[i][j] + inv[j][i];
+            }
+        }
+        for (int c = 0; c < combos; c++) {
+            int rem = c;
+            for (int ax = 0; ax < dim; ax++) {
+                final int k = rem % span - kmax;
+                rem /= span;
+                shift[c][ax] = TWO_PI * k;
+            }
+            double form = 0.0;
+            for (int i = 0; i < dim; i++) {
+                for (int j = 0; j < dim; j++) form += inv[i][j] * shift[c][i] * shift[c][j];
+            }
+            shiftForm[c] = form;
+        }
+        final double reach = TWO_PI + maxAbsY + TWO_PI * kmax;
+        final double gap = SCREEN_GAP + 1.0e-12 * invSum * reach * reach;
+        final double[] b = new double[dim];
+        final double[] ab = new double[dim];
         final double[] d = new double[dim];
+        final double[] screen = new double[combos];
         final double[] q = new double[combos];
         for (int idx = 0; idx < nTotal; idx++) {
+            for (int ax = 0; ax < dim; ax++) b[ax] = angleValue[ax][idx] - y[ax];
+            for (int i = 0; i < dim; i++) {
+                double v = 0.0;
+                for (int j = 0; j < dim; j++) v += sym[i][j] * b[j];
+                ab[i] = v;
+            }
+            double smin = Double.POSITIVE_INFINITY;
+            for (int c = 0; c < combos; c++) {
+                double v = shiftForm[c];
+                for (int ax = 0; ax < dim; ax++) v += shift[c][ax] * ab[ax];
+                screen[c] = v;
+                if (v < smin) smin = v;
+            }
             double qmin = Double.POSITIVE_INFINITY;
             for (int c = 0; c < combos; c++) {
-                int rem = c;
-                for (int ax = 0; ax < dim; ax++) {
-                    final int k = rem % span - kmax;
-                    rem /= span;
-                    d[ax] = angleOf(idx, ax) - y[ax] + TWO_PI * k;
-                }
+                if (screen[c] - smin > gap) continue;               // exactly zero term, see above
+                for (int ax = 0; ax < dim; ax++) d[ax] = b[ax] + shift[c][ax];
                 double form = 0.0;
                 for (int i = 0; i < dim; i++) {
                     for (int j = 0; j < dim; j++) form += inv[i][j] * d[i] * d[j];
@@ -454,10 +513,18 @@ public class TorusFourierKernel {
                 if (form < qmin) qmin = form;
             }
             double acc = 0.0;
-            for (int c = 0; c < combos; c++) acc += Math.exp(-0.5 * (q[c] - qmin));
+            for (int c = 0; c < combos; c++) {
+                if (screen[c] - smin > gap) continue;
+                final double diff = q[c] - qmin;
+                acc += diff == 0.0 ? 1.0 : Math.exp(-0.5 * diff);  // exp(-0.0) is exactly 1.0
+            }
             out[idx] += Math.exp(logNorm + Math.log(acc) - 0.5 * qmin);
         }
     }
+
+    /** An image whose exponent trails the leading one by more than this (in q, so 760 in the exponent)
+     *  underflows to exactly 0.0 (exp(x) is 0.0 for x <= -745.2). */
+    private static final double SCREEN_GAP = 1520.0;
 
     /**
      * Production leaf kernel: zero-jump term analytic, remaining jump mass spectral.
@@ -490,7 +557,7 @@ public class TorusFourierKernel {
         final double[] m = new double[dim];
         final double scale = (double) nTotal / volume;
         for (int idx = 0; idx < nTotal; idx++) {
-            modeOf(idx, m);
+            for (int ax = 0; ax < dim; ax++) m[ax] = modeValue[ax][idx];
             double phase = 0.0;
             for (int ax = 0; ax < dim; ax++) phase += m[ax] * y[ax];
             final double cp = Math.cos(phase), sp = Math.sin(phase);
@@ -627,6 +694,47 @@ public class TorusFourierKernel {
                 pr += jumpRate * (phiRe - 1.0);
                 pi += jumpRate * phiIm;
             }
+            psiRe[idx] = pr;
+            psiIm[idx] = pi;
+        }
+    }
+
+    /**
+     * The jump mixture's characteristic function phi(m) = sum_k w_k exp(-1/2 m'S_k m) exp(i m.d_k),
+     * accumulated exactly as computePsiComplex accumulates it. The mixture is fixed for a run, so a
+     * likelihood computes this once instead of once per residue per evaluation.
+     */
+    public void computeJumpCharacteristic(double[] w, double[][] d, double[][][] s,
+                                          double[] phiRe, double[] phiIm) {
+        final double[] m = new double[dim];
+        for (int idx = 0; idx < nTotal; idx++) {
+            for (int ax = 0; ax < dim; ax++) m[ax] = modeValue[ax][idx];
+            double re = 0.0, im = 0.0;
+            for (int k = 0; k < w.length; k++) {
+                final double g = w[k] * Math.exp(-0.5 * quadForm(s[k], m));
+                double md = 0.0;
+                for (int ax = 0; ax < dim; ax++) md += m[ax] * d[k][ax];
+                re += g * Math.cos(md);
+                im += g * Math.sin(md);
+            }
+            phiRe[idx] = re;
+            phiIm[idx] = im;
+        }
+    }
+
+    /**
+     * computePsiComplex(sigma, jumpRate, w, d, s, ...) for jumpRate > 0 and a complete mixture, from
+     * its characteristic function (computeJumpCharacteristic). Same arithmetic, same bits.
+     */
+    public void computePsiFromCharacteristic(double[][] sigma, double jumpRate, double[] phiRe, double[] phiIm,
+                                             double[] psiRe, double[] psiIm) {
+        final double[] m = new double[dim];
+        for (int idx = 0; idx < nTotal; idx++) {
+            for (int ax = 0; ax < dim; ax++) m[ax] = modeValue[ax][idx];
+            double pr = -0.5 * quadForm(sigma, m);
+            double pi = 0.0;
+            pr += jumpRate * (phiRe[idx] - 1.0);
+            pi += jumpRate * phiIm[idx];
             psiRe[idx] = pr;
             psiIm[idx] = pi;
         }
