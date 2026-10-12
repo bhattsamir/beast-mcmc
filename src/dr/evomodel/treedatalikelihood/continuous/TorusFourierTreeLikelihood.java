@@ -382,8 +382,53 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         this.nodeLogScale = new double[nResidues][nodeCount];
         this.storedNodeLogScale = new double[nResidues][nodeCount];
         this.messageFlipped = new boolean[nResidues][nodeCount];
+        this.lastBranchLength = new double[nodeCount];
+        this.storedLastBranchLength = new double[nodeCount];
+        this.branchLengths = new double[nodeCount];
+        Arrays.fill(lastBranchLength, Double.NaN);
+
+        this.updateNode = new boolean[nodeCount];
+        this.residueDirty = new boolean[nResidues];
+        this.storedUpdateNode = new boolean[nodeCount];
+        this.storedResidueDirty = new boolean[nResidues];
+        this.sampledAnc = new double[nResidues][nodeCount][];
+        updateAllNodes();
+        Arrays.fill(residueDirty, true);
+
+        if (tree instanceof Model) addModel((Model) tree);
+        if (branchRateModel != null) addModel(branchRateModel);
+        for (MatrixParameter p : precisions) addVariable(p);
+        // Only the rate lambda is sampled (mixture components are fixed). jumpRate may be
+        // per-residue (dim = nResidues, one lambda each -> a move dirties only that residue) or
+        // shared (dim 1 -> dirties all). See handleVariableChangedEvent.
+        if (jumpRate != null) addVariable(jumpRate);
+        // Sigma_eps is shared by every residue, so a change to it dirties all of them
+        // (handleVariableChangedEvent's catch-all branch).
+        if (sigmaEpsilon != null) {
+            final int sd = sigmaEpsilon.getDimension();
+            if (sigmaEpsilon instanceof MatrixParameter) {
+                final MatrixParameter mp = (MatrixParameter) sigmaEpsilon;
+                if (mp.getRowDimension() != dim || mp.getColumnDimension() != dim) {
+                    throw new IllegalArgumentException("sigmaEpsilon matrix must be " + dim + "x" + dim);
+                }
+            } else if (sd != 1 && sd != dim) {
+                throw new IllegalArgumentException("sigmaEpsilon must have dimension 1 (isotropic) or "
+                        + dim + " (per-axis variances), got " + sd);
+            }
+            sigmaEpsilonMatrix();      // fail at construction, not mid-chain, on a bad Sigma_eps
+            addVariable(sigmaEpsilon);
+        }
+        if (jumpLaw == JumpLaw.LANDING) requireLandingObservationError();
+        logSigmaEpsilon(name);
+        if (jumpLaw == JumpLaw.LANDING) {
+            Logger.getLogger("dr.evomodel").info("TorusFourierTreeLikelihood '" + name
+                    + "': JUMP_LAW = landing (fixed absolute basin means, stationary landing root), nGrid="
+                    + kernel.getGridSize() + ", strict numerical audit=" + strictLandingNumerics);
+        }
+
         // Heap accounting, conservative: a grid costs its header and payload, doubled from 256 KB up,
-        // where G1 may store it as a humongous object in a region twice its size.
+        // where G1 may store it as a humongous object in a region twice its size. Done last, after every
+        // check that can reject the arguments, so a failed construction reserves no tip-cache budget.
         final long gridBytes = gridHeapBytes(n2);
         final long maxHeap = Runtime.getRuntime().maxMemory();
         long messageBytes = 0L;
@@ -432,49 +477,6 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             Logger.getLogger("dr.evomodel").warning(footprint + "; the run is likely to exhaust the heap (raise -Xmx)");
         } else {
             Logger.getLogger("dr.evomodel").info(footprint);
-        }
-        this.lastBranchLength = new double[nodeCount];
-        this.storedLastBranchLength = new double[nodeCount];
-        this.branchLengths = new double[nodeCount];
-        Arrays.fill(lastBranchLength, Double.NaN);
-
-        this.updateNode = new boolean[nodeCount];
-        this.residueDirty = new boolean[nResidues];
-        this.storedUpdateNode = new boolean[nodeCount];
-        this.storedResidueDirty = new boolean[nResidues];
-        this.sampledAnc = new double[nResidues][nodeCount][];
-        updateAllNodes();
-        Arrays.fill(residueDirty, true);
-
-        if (tree instanceof Model) addModel((Model) tree);
-        if (branchRateModel != null) addModel(branchRateModel);
-        for (MatrixParameter p : precisions) addVariable(p);
-        // Only the rate lambda is sampled (mixture components are fixed). jumpRate may be
-        // per-residue (dim = nResidues, one lambda each -> a move dirties only that residue) or
-        // shared (dim 1 -> dirties all). See handleVariableChangedEvent.
-        if (jumpRate != null) addVariable(jumpRate);
-        // Sigma_eps is shared by every residue, so a change to it dirties all of them
-        // (handleVariableChangedEvent's catch-all branch).
-        if (sigmaEpsilon != null) {
-            final int sd = sigmaEpsilon.getDimension();
-            if (sigmaEpsilon instanceof MatrixParameter) {
-                final MatrixParameter mp = (MatrixParameter) sigmaEpsilon;
-                if (mp.getRowDimension() != dim || mp.getColumnDimension() != dim) {
-                    throw new IllegalArgumentException("sigmaEpsilon matrix must be " + dim + "x" + dim);
-                }
-            } else if (sd != 1 && sd != dim) {
-                throw new IllegalArgumentException("sigmaEpsilon must have dimension 1 (isotropic) or "
-                        + dim + " (per-axis variances), got " + sd);
-            }
-            sigmaEpsilonMatrix();      // fail at construction, not mid-chain, on a bad Sigma_eps
-            addVariable(sigmaEpsilon);
-        }
-        if (jumpLaw == JumpLaw.LANDING) requireLandingObservationError();
-        logSigmaEpsilon(name);
-        if (jumpLaw == JumpLaw.LANDING) {
-            Logger.getLogger("dr.evomodel").info("TorusFourierTreeLikelihood '" + name
-                    + "': JUMP_LAW = landing (fixed absolute basin means, stationary landing root), nGrid="
-                    + kernel.getGridSize() + ", strict numerical audit=" + strictLandingNumerics);
         }
     }
 
