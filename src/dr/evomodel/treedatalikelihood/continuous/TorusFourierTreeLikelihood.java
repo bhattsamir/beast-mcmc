@@ -117,6 +117,24 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     // instead of flipping back onto the stored one, which a later restore would hand back corrupted.
     private final boolean[][] flipped;                 // [nResidues][nodeCount]
 
+    // ---- landing hot path ----
+    // Per residue, the branch-independent tables of the landing operator for its current Sigma and
+    // lambda; the kernel hands back the same tables while both are bit-for-bit unchanged.
+    private final TorusFourierKernel.LandingTables[] landingTables;
+    // The Fourier coefficients of a landing tip depend only on its angles and Sigma_eps, so they are
+    // computed once and kept, for residues r < tipCacheResidues (a memory budget, see the
+    // constructor). They are checked against the bits of Sigma_eps at every evaluation: a rejected
+    // Sigma_eps proposal restores the parameter without an event, so validity cannot rest on events.
+    private final double[][][] tipCoefficientRe;       // [residue][node], allocated on first use
+    private final double[][][] tipCoefficientIm;
+    private final boolean[][] tipCoefficientValid;
+    private double[][] tipCoefficientSigmaEps;         // the Sigma_eps the coefficients were built for
+    private final int tipCacheResidues;
+    // Working arrays for one residue's sweep {message, imaginary part, damping, reset}, pooled so the
+    // branch operations allocate nothing. Results never depend on which set a sweep receives.
+    private final java.util.concurrent.ConcurrentLinkedDeque<double[][]> landingScratch =
+            new java.util.concurrent.ConcurrentLinkedDeque<double[][]>();
+
     // ---- dirty bookkeeping ----
     private final boolean[] updateNode;                // [nodeCount], shared across residues (tree/rate moves)
     private final boolean[] residueDirty;              // [nResidues], set when that residue's precision changes
@@ -299,6 +317,37 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         this.storedCurrentIndex = new int[nResidues][nodeCount];
         this.storedNodeLogScale = new double[nResidues][nodeCount];
         this.flipped = new boolean[nResidues][nodeCount];
+        if (jumpLaw == JumpLaw.LANDING) {
+            this.landingTables = new TorusFourierKernel.LandingTables[nResidues];
+            // Tip-coefficient cache: 2 * nGrid^dim doubles per observed tip and residue. Residues are
+            // cached in index order while the total stays within the budget, by default a quarter
+            // of the maximum heap; -Dtorus.landing.tipCacheMB sets it (0 turns the cache off).
+            final long requestedMB = Long.getLong("torus.landing.tipCacheMB", -1L);
+            final long budget = requestedMB >= 0 ? requestedMB << 20 : Runtime.getRuntime().maxMemory() / 4;
+            long used = 0L;
+            int cached = 0;
+            for (int r = 0; r < nResidues; r++) {
+                long observed = 0L;
+                for (double[] tip : tipData[r]) if (tip != null) observed++;
+                final long bytes = observed * 2L * n2 * Double.BYTES;
+                if (used + bytes > budget) break;
+                used += bytes;
+                cached++;
+            }
+            this.tipCacheResidues = cached;
+            this.tipCoefficientRe = new double[cached][nodeCount][];
+            this.tipCoefficientIm = new double[cached][nodeCount][];
+            this.tipCoefficientValid = new boolean[cached][nodeCount];
+            Logger.getLogger("dr.evomodel").info("TorusFourierTreeLikelihood '" + name
+                    + "': landing tip coefficients cached for " + cached + " of " + nResidues
+                    + " residues (" + (used >> 20) + " MB of a " + (budget >> 20) + " MB budget)");
+        } else {
+            this.landingTables = null;
+            this.tipCacheResidues = 0;
+            this.tipCoefficientRe = null;
+            this.tipCoefficientIm = null;
+            this.tipCoefficientValid = null;
+        }
 
         this.updateNode = new boolean[nodeCount];
         this.residueDirty = new boolean[nResidues];
@@ -656,6 +705,7 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     /** Landing has its own root, branch operator, and optional positive reference. */
     private double calculateLandingLogLikelihood() {
         final double[][] sigmaEps = requireLandingObservationError();
+        refreshTipCoefficients(sigmaEps);
         final NodeRef root = tree.getRoot();
         java.util.stream.IntStream stream = java.util.stream.IntStream.range(0, nResidues);
         if (nResidues >= PARALLEL_THRESHOLD) stream = stream.parallel();
@@ -665,48 +715,12 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             if (!Double.isFinite(lambda) || lambda < 0.0) {
                 throw new IllegalArgumentException("landing jumpRate must be finite and nonnegative");
             }
-            final boolean changed = updateLandingNodePartial(r, root, sigma, lambda, sigmaEps);
-            if (changed || Double.isNaN(acceptedResidueLogL[r])) {
-                final int rn = root.getNumber();
-                final double rootMass = kernel.rootIntegralLanding(
-                        partials[currentIndex[r][rn]][r][rn], sigma, lambda, landingGhatRe, landingGhatIm);
-                final double fft = rootMass > 0.0 && Double.isFinite(rootMass)
-                        ? nodeLogScale[r][rn] + Math.log(rootMass) : Double.NaN;
-                if (validateEveryEvaluation) {
-                    final TorusLandingPruning.Result reference = landingReference(r, sigma, lambda, sigmaEps);
-                    landingStableResults[r] = reference;
-                    acceptedResidueLogL[r] = Double.isFinite(fft)
-                            && Math.abs(fft - reference.logLikelihood) <= TorusLandingPruning.LOG_TOLERANCE
-                            ? fft : reference.logLikelihood;
-                } else {
-                    if (!Double.isFinite(fft)) {
-                        // The root integral is non-positive or non-finite: at this nGrid the
-                        // landing likelihood is UNDEFINED for this parameter value (Fourier
-                        // truncation makes the root mass ring negative). Throwing here would kill
-                        // an MCMC thread on an ordinary proposal; instead return -inf so the move
-                        // is rejected -- what the shift path already does for an unusable FFT
-                        // state, and the BEAST convention. The posterior is thereby restricted to
-                        // the region the chosen grid can evaluate; every occurrence is counted.
-                        if (strictLandingNumerics) {
-                            throw new ArithmeticException("Invalid landing root integral for residue " + r
-                                    + " at nGrid=" + kernel.getGridSize()
-                                    + "; check grid convergence and covariance conditioning");
-                        }
-                        landingUndefinedEvaluations.incrementAndGet();
-                        if (landingUndefinedWarning.compareAndSet(false, true)) {
-                            Logger.getLogger("dr.evomodel").warning("TorusFourierTreeLikelihood '" + getId()
-                                    + "': landing likelihood undefined (non-positive root integral) for residue "
-                                    + r + " at nGrid=" + kernel.getGridSize() + "; returning -inf so the state is"
-                                    + " rejected. Further occurrences are counted, not logged"
-                                    + " (getLandingUndefinedEvaluations); -Dtorus.landing.strict=true throws instead.");
-                        }
-                        acceptedResidueLogL[r] = Double.NEGATIVE_INFINITY;
-                    } else {
-                        acceptedResidueLogL[r] = fft;
-                    }
-                    landingStableResults[r] = null;
-                }
-                stableResults[r] = null;
+            double[][] scratch = landingScratch.poll();
+            if (scratch == null) scratch = new double[4][n2];
+            try {
+                landingResidue(r, root, sigma, lambda, sigmaEps, scratch);
+            } finally {
+                landingScratch.offer(scratch);
             }
         });
         double total = 0.0;
@@ -717,14 +731,101 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         return total;
     }
 
-    private boolean updateLandingNodePartial(int r, NodeRef node, double[][] sigma,
-                                              double lambda, double[][] sigmaEps) {
+    /** Invalidate the cached tip coefficients if Sigma_eps is not bit for bit what they were built for. */
+    private void refreshTipCoefficients(double[][] sigmaEps) {
+        boolean same = tipCoefficientSigmaEps != null;
+        for (int i = 0; i < dim && same; i++) {
+            for (int j = 0; j < dim && same; j++) {
+                same = Double.doubleToRawLongBits(sigmaEps[i][j])
+                        == Double.doubleToRawLongBits(tipCoefficientSigmaEps[i][j]);
+            }
+        }
+        if (same) return;
+        for (int r = 0; r < tipCacheResidues; r++) Arrays.fill(tipCoefficientValid[r], false);
+        tipCoefficientSigmaEps = new double[dim][];
+        for (int i = 0; i < dim; i++) tipCoefficientSigmaEps[i] = sigmaEps[i].clone();
+    }
+
+    /** One residue of calculateLandingLogLikelihood, with that sweep's working arrays. */
+    private void landingResidue(int r, NodeRef root, double[][] sigma, double lambda, double[][] sigmaEps,
+                                double[][] scratch) {
+        final TorusFourierKernel.LandingTables tables = kernel.landingTables(landingTables[r], sigma, lambda);
+        landingTables[r] = tables;
+        final boolean changed = updateLandingNodePartial(r, root, sigma, lambda, sigmaEps, tables, scratch);
+        if (changed || Double.isNaN(acceptedResidueLogL[r])) {
+            final int rn = root.getNumber();
+            final double rootMass = kernel.rootIntegralLanding(partials[currentIndex[r][rn]][r][rn], tables,
+                    sigma, landingGhatRe, landingGhatIm, scratch[0], scratch[1]);
+            final double fft = rootMass > 0.0 && Double.isFinite(rootMass)
+                    ? nodeLogScale[r][rn] + Math.log(rootMass) : Double.NaN;
+            if (validateEveryEvaluation) {
+                final TorusLandingPruning.Result reference = landingReference(r, sigma, lambda, sigmaEps);
+                landingStableResults[r] = reference;
+                acceptedResidueLogL[r] = Double.isFinite(fft)
+                        && Math.abs(fft - reference.logLikelihood) <= TorusLandingPruning.LOG_TOLERANCE
+                        ? fft : reference.logLikelihood;
+            } else {
+                if (!Double.isFinite(fft)) {
+                    // The root integral is non-positive or non-finite: at this nGrid the
+                    // landing likelihood is UNDEFINED for this parameter value (Fourier
+                    // truncation makes the root mass ring negative). Throwing here would kill
+                    // an MCMC thread on an ordinary proposal; instead return -inf so the move
+                    // is rejected -- what the shift path already does for an unusable FFT
+                    // state, and the BEAST convention. The posterior is thereby restricted to
+                    // the region the chosen grid can evaluate; every occurrence is counted.
+                    if (strictLandingNumerics) {
+                        throw new ArithmeticException("Invalid landing root integral for residue " + r
+                                + " at nGrid=" + kernel.getGridSize()
+                                + "; check grid convergence and covariance conditioning");
+                    }
+                    landingUndefinedEvaluations.incrementAndGet();
+                    if (landingUndefinedWarning.compareAndSet(false, true)) {
+                        Logger.getLogger("dr.evomodel").warning("TorusFourierTreeLikelihood '" + getId()
+                                + "': landing likelihood undefined (non-positive root integral) for residue "
+                                + r + " at nGrid=" + kernel.getGridSize() + "; returning -inf so the state is"
+                                + " rejected. Further occurrences are counted, not logged"
+                                + " (getLandingUndefinedEvaluations); -Dtorus.landing.strict=true throws instead.");
+                    }
+                    acceptedResidueLogL[r] = Double.NEGATIVE_INFINITY;
+                } else {
+                    acceptedResidueLogL[r] = fft;
+                }
+                landingStableResults[r] = null;
+            }
+            stableResults[r] = null;
+        }
+    }
+
+    /** The message a landing tip sends up its branch, from cached coefficients where the budget allows. */
+    private double[] landingTipMessage(int r, int tip, double[] theta, double[][] sigma, double t,
+                                       double[][] sigmaEps, TorusFourierKernel.LandingTables tables,
+                                       double[][] scratch) {
+        if (r < tipCacheResidues) {
+            if (!tipCoefficientValid[r][tip]) {
+                if (tipCoefficientRe[r][tip] == null) {
+                    tipCoefficientRe[r][tip] = new double[n2];
+                    tipCoefficientIm[r][tip] = new double[n2];
+                }
+                kernel.landingTipCoefficients(theta, sigmaEps, tipCoefficientRe[r][tip], tipCoefficientIm[r][tip]);
+                tipCoefficientValid[r][tip] = true;
+            }
+            return kernel.leafKernelLandingFromCoefficients(tipCoefficientRe[r][tip], tipCoefficientIm[r][tip],
+                    tables, sigma, t, landingGhatRe, landingGhatIm, scratch[0], scratch[1], scratch[2], scratch[3]);
+        }
+        kernel.landingTipCoefficients(theta, sigmaEps, scratch[0], scratch[1]);
+        return kernel.leafKernelLandingFromCoefficients(scratch[0], scratch[1], tables, sigma, t,
+                landingGhatRe, landingGhatIm, scratch[0], scratch[1], scratch[2], scratch[3]);
+    }
+
+    private boolean updateLandingNodePartial(int r, NodeRef node, double[][] sigma, double lambda,
+                                              double[][] sigmaEps, TorusFourierKernel.LandingTables tables,
+                                              double[][] scratch) {
         final int nn = node.getNumber();
         boolean changed = false;
         for (int c = 0; c < tree.getChildCount(node); c++) {
             final NodeRef child = tree.getChild(node, c);
             changed |= tree.isExternal(child) ? updateNode[child.getNumber()]
-                    : updateLandingNodePartial(r, child, sigma, lambda, sigmaEps);
+                    : updateLandingNodePartial(r, child, sigma, lambda, sigmaEps, tables, scratch);
         }
         if (!(changed || updateNode[nn] || residueDirty[r])) return false;
         final int target = flipped[r][nn] ? currentIndex[r][nn] : 1 - currentIndex[r][nn];
@@ -734,14 +835,14 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         for (int c = 0; c < tree.getChildCount(node); c++) {
             final NodeRef child = tree.getChild(node, c);
             final int cn = child.getNumber();
-            final double[] message;
+            final double[] message;   // scratch[0] (or the shared flat leaf), consumed before the next child
             if (tree.isExternal(child)) {
                 final double[] theta = tipData[r][cn];
-                message = theta == null ? flatLeaf : kernel.leafKernelLanding(theta, sigmaEps,
-                        sigma, branchLength(child), lambda, landingGhatRe, landingGhatIm);
+                message = theta == null ? flatLeaf
+                        : landingTipMessage(r, cn, theta, sigma, branchLength(child), sigmaEps, tables, scratch);
             } else {
-                message = kernel.propagateLanding(partials[currentIndex[r][cn]][r][cn],
-                        sigma, branchLength(child), lambda, landingGhatRe, landingGhatIm);
+                message = kernel.propagateLanding(partials[currentIndex[r][cn]][r][cn], tables, sigma,
+                        branchLength(child), landingGhatRe, landingGhatIm, scratch[0], scratch[1], scratch[2], scratch[3]);
                 scale += nodeLogScale[r][cn];
             }
             // Preserve spectral values exactly: flooring small or negative tails here

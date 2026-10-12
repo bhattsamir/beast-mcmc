@@ -91,7 +91,30 @@ public class TorusFourierKernel {
         for (int direction = 0; direction < 2; direction++) {
             fillTwiddles(direction == 1, twiddleRe[direction], twiddleIm[direction]);
         }
+        // Mode vectors as modeOf computes them, and the index of -m (see mirrorIndex).
+        this.modeValue = new double[dim][nTotal];
+        this.mirrorIndex = new int[nTotal];
+        for (int idx = 0; idx < nTotal; idx++) {
+            int mirror = 0;
+            for (int ax = 0; ax < dim; ax++) {
+                final int i = (idx / stride[ax]) % nGrid;
+                modeValue[ax][idx] = freq[i];
+                if (mirror >= 0) mirror = i == nGrid / 2 ? -1 : mirror + ((nGrid - i) % nGrid) * stride[ax];
+            }
+            mirrorIndex[idx] = mirror;
+        }
     }
+
+    // ---- per-mode tables ----
+    // modeValue[ax][idx] is the mode vector modeOf(idx) fills in, read from a table instead of an
+    // integer division and remainder per axis. mirrorIndex[idx] is the index of the mode -m when no
+    // axis sits at the Nyquist index (whose negation is not on the grid), and -1 otherwise.
+    // quadForm(S, -m) equals quadForm(S, m) bit for bit -- every product s_ij m_i m_j has both signs
+    // flipped -- so any per-mode quantity built from it is the same at m and -m, and the landing
+    // branch operator evaluates its exponentials once per mirror pair. LandingTables verifies the
+    // equality on its own values before relying on it.
+    private final double[][] modeValue;
+    private final int[] mirrorIndex;
 
     // ---- planned FFT ----
     // fftN applies FastFourierTransform.fft (Numerical Recipes four1) along every axis. Its plan
@@ -1159,28 +1182,106 @@ public class TorusFourierKernel {
     }
 
     /**
+     * The branch-independent part of the landing operator for one (Sigma, lambda):
+     * rate[idx] = lambda + a_m and, for lambda > 0, weight[idx] = lambda / (lambda + a_m), with
+     * a_m = 0.5 m' Sigma m. These are exactly the values applyLanding and rootIntegralLanding
+     * used to recompute per mode on every branch. A residue keeps one while its Sigma and lambda
+     * are unchanged, which the key (their raw bits) records.
+     */
+    static final class LandingTables {
+        private final long[] key;
+        final double lambda;
+        final double[] rate;
+        final double[] weight;
+        /** rate and weight agree bit for bit at every mirror pair, so one exponential serves both. */
+        final boolean mirrorExact;
+
+        private LandingTables(long[] key, double lambda, double[] rate, double[] weight, boolean mirrorExact) {
+            this.key = key;
+            this.lambda = lambda;
+            this.rate = rate;
+            this.weight = weight;
+            this.mirrorExact = mirrorExact;
+        }
+    }
+
+    private long[] landingKey(double[][] sigma, double lambda) {
+        final long[] key = new long[dim * dim + 1];
+        for (int i = 0; i < dim; i++) {
+            for (int j = 0; j < dim; j++) key[i * dim + j] = Double.doubleToRawLongBits(sigma[i][j]);
+        }
+        key[dim * dim] = Double.doubleToRawLongBits(lambda);
+        return key;
+    }
+
+    /** Tables for (sigma, lambda): `previous` itself when it was built for the same bits. */
+    LandingTables landingTables(LandingTables previous, double[][] sigma, double lambda) {
+        requireLandingCovariance(sigma, "Diffusion covariance");
+        requireLandingRate(lambda);
+        final long[] key = landingKey(sigma, lambda);
+        if (previous != null && java.util.Arrays.equals(previous.key, key)) return previous;
+        final double[] rate = new double[nTotal];
+        final double[] weight = lambda > 0.0 ? new double[nTotal] : null;
+        final double[] m = new double[dim];
+        for (int idx = 0; idx < nTotal; idx++) {
+            for (int ax = 0; ax < dim; ax++) m[ax] = modeValue[ax][idx];
+            final double a = 0.5 * quadForm(sigma, m);
+            rate[idx] = lambda + a;
+            if (weight != null) weight[idx] = lambda / (lambda + a);
+        }
+        boolean mirrorExact = true;
+        for (int idx = 0; idx < nTotal && mirrorExact; idx++) {
+            final int mi = mirrorIndex[idx];
+            if (mi < 0) continue;
+            mirrorExact = Double.doubleToRawLongBits(rate[idx]) == Double.doubleToRawLongBits(rate[mi])
+                    && (weight == null || Double.doubleToRawLongBits(weight[idx]) == Double.doubleToRawLongBits(weight[mi]));
+        }
+        return new LandingTables(key, lambda, rate, weight, mirrorExact);
+    }
+
+    private void requireTables(LandingTables tables, double[][] sigma, double lambda) {
+        if (!java.util.Arrays.equals(tables.key, landingKey(sigma, lambda))) {
+            throw new IllegalStateException("landing tables were built for a different Sigma or lambda");
+        }
+    }
+
+    /**
      * Apply the backward reset operator to FFT coefficients. The reset contribution
      * is a scalar in real space, hence is accumulated at mode zero before the inverse FFT.
      * The input coefficients use FFT normalization, so no extra nTotal factor belongs here.
+     *
+     * Per mode this is the arithmetic the operator always used: x = -(lambda + a_m) t, damping
+     * exp(x), reset mass (lambda / (lambda + a_m)) * -expm1(x), compensated sum in index order.
+     * The exponentials are evaluated first, once per mirror pair, into `damping` and `reset`.
      */
-    private void applyLanding(double[] re, double[] im, double[][] sigma, double t,
-                              double lambda, double[] ghatRe, double[] ghatIm) {
-        final double[] m = new double[dim];
+    private void applyLanding(double[] re, double[] im, LandingTables tables, double t,
+                              double[] ghatRe, double[] ghatIm, double[] damping, double[] reset) {
+        final double[] rate = tables.rate, weight = tables.weight;
+        final boolean jumps = tables.lambda > 0.0;
+        for (int idx = 0; idx < nTotal; idx++) {
+            final int mi = tables.mirrorExact ? mirrorIndex[idx] : -1;
+            if (mi >= 0 && mi < idx) continue;            // already filled from its mirror
+            final double x = -rate[idx] * t;
+            final double e = Math.exp(x);
+            damping[idx] = e;
+            if (jumps) reset[idx] = weight[idx] * -Math.expm1(x);
+            if (mi > idx) {
+                damping[mi] = e;
+                if (jumps) reset[mi] = reset[idx];
+            }
+        }
         double correction = 0.0, compensation = 0.0;
         for (int idx = 0; idx < nTotal; idx++) {
-            modeOf(idx, m);
-            final double a = 0.5 * quadForm(sigma, m);
-            if (lambda > 0.0) {
-                final double term = landingResetMass(a, t, lambda)
-                        * (ghatRe[idx] * re[idx] - ghatIm[idx] * im[idx]);
+            if (jumps) {
+                final double term = reset[idx] * (ghatRe[idx] * re[idx] - ghatIm[idx] * im[idx]);
                 final double adjusted = term - compensation;
                 final double next = correction + adjusted;
                 compensation = (next - correction) - adjusted;
                 correction = next;
             }
-            final double damping = Math.exp(-(lambda + a) * t);
-            re[idx] *= damping;
-            im[idx] *= damping;
+            final double d = damping[idx];
+            re[idx] *= d;
+            im[idx] *= d;
         }
         re[0] += correction;
     }
@@ -1193,29 +1294,68 @@ public class TorusFourierKernel {
         requireLandingTime(t);
         requireLandingRate(lambda);
         requireLandingGhat(lambda, ghatRe, ghatIm);
-        final double[] re = partial.clone();
-        if (t == 0.0) return auditLandingGrid(re, false);
-        final double[] im = new double[nTotal];
-        fftN(re, im, false);
-        applyLanding(re, im, sigma, t, lambda, ghatRe, ghatIm);
-        fftN(re, im, true);
-        return auditLandingGrid(re, false);
+        if (t == 0.0) return auditLandingGrid(partial.clone(), false);
+        return propagateLanding(partial, landingTables(null, sigma, lambda), sigma, t, ghatRe, ghatIm,
+                new double[nTotal], new double[nTotal], new double[nTotal], new double[nTotal]);
     }
 
-    private void landingTipCoefficients(double[] theta, double[][] sigmaEps,
-                                         double[] re, double[] im) {
+    /**
+     * propagateLanding with tables for (sigma, lambda) and caller-owned arrays: the message is
+     * written to `out` and returned; im, damping and reset are scratch.
+     */
+    double[] propagateLanding(double[] partial, LandingTables tables, double[][] sigma, double t,
+                              double[] ghatRe, double[] ghatIm,
+                              double[] out, double[] im, double[] damping, double[] reset) {
+        requireLandingArray(partial, nTotal, "partial");
+        requireLandingCovariance(sigma, "Diffusion covariance");
+        requireLandingTime(t);
+        requireLandingRate(tables.lambda);
+        requireLandingGhat(tables.lambda, ghatRe, ghatIm);
+        requireTables(tables, sigma, tables.lambda);
+        System.arraycopy(partial, 0, out, 0, nTotal);
+        if (t == 0.0) return auditLandingGrid(out, false);
+        java.util.Arrays.fill(im, 0.0);
+        fftN(out, im, false);
+        applyLanding(out, im, tables, t, ghatRe, ghatIm, damping, reset);
+        fftN(out, im, true);
+        return auditLandingGrid(out, false);
+    }
+
+    /**
+     * Fourier coefficients of a landing tip: exp(-i m.theta) * exp(-1/2 m' Sigma_eps m), scaled to
+     * FFT normalization. Depend on nothing but the tip angles and Sigma_eps, so the likelihood
+     * computes them once and keeps them (see leafKernelLandingFromCoefficients).
+     */
+    void landingTipCoefficients(double[] theta, double[][] sigmaEps, double[] re, double[] im) {
         requireLandingAngles(theta, "Tip angles");
         requireLandingCovariance(sigmaEps, "Landing tip-error covariance");
-        final double[] m = new double[dim];
-        final double scale = (double) nTotal / volume;
+        final double[] magnitude = tipMagnitude(sigmaEps);
+        final double[] wrapped = new double[dim];
+        for (int ax = 0; ax < dim; ax++) wrapped[ax] = Math.IEEEremainder(theta[ax], TWO_PI);
         for (int idx = 0; idx < nTotal; idx++) {
-            modeOf(idx, m);
             double phase = 0.0;
-            for (int ax = 0; ax < dim; ax++) phase += m[ax] * Math.IEEEremainder(theta[ax], TWO_PI);
-            final double magnitude = scale * Math.exp(-0.5 * quadForm(sigmaEps, m));
-            re[idx] = magnitude * Math.cos(phase);
-            im[idx] = -magnitude * Math.sin(phase);
+            for (int ax = 0; ax < dim; ax++) phase += modeValue[ax][idx] * wrapped[ax];
+            re[idx] = magnitude[idx] * Math.cos(phase);
+            im[idx] = -magnitude[idx] * Math.sin(phase);
         }
+    }
+
+    /** scale * exp(-1/2 m' Sigma_eps m) at every mode, for the most recent Sigma_eps (shared, immutable). */
+    private volatile Object[] tipMagnitudeMemo;          // {long[] key, double[] magnitude}
+
+    private double[] tipMagnitude(double[][] sigmaEps) {
+        final long[] key = landingKey(sigmaEps, 0.0);
+        final Object[] memo = tipMagnitudeMemo;
+        if (memo != null && java.util.Arrays.equals((long[]) memo[0], key)) return (double[]) memo[1];
+        final double scale = (double) nTotal / volume;
+        final double[] magnitude = new double[nTotal];
+        final double[] m = new double[dim];
+        for (int idx = 0; idx < nTotal; idx++) {
+            for (int ax = 0; ax < dim; ax++) m[ax] = modeValue[ax][idx];
+            magnitude[idx] = scale * Math.exp(-0.5 * quadForm(sigmaEps, m));
+        }
+        tipMagnitudeMemo = new Object[]{key, magnitude};
+        return magnitude;
     }
 
     /** Pure Fourier tip with strictly positive-definite observation-error covariance. */
@@ -1241,9 +1381,28 @@ public class TorusFourierKernel {
         final double[] re = new double[nTotal];
         final double[] im = new double[nTotal];
         landingTipCoefficients(theta, sigmaEps, re, im);
-        applyLanding(re, im, sigma, t, lambda, ghatRe, ghatIm);
-        fftN(re, im, true);
-        return auditLandingGrid(re, false);
+        return leafKernelLandingFromCoefficients(re, im, landingTables(null, sigma, lambda), sigma, t,
+                ghatRe, ghatIm, re, im, new double[nTotal], new double[nTotal]);
+    }
+
+    /**
+     * leafKernelLanding from a tip's coefficients (landingTipCoefficients), with tables for
+     * (sigma, lambda) and caller-owned arrays. The coefficients are copied into out/im first, so
+     * they survive unless the caller passes them as out/im.
+     */
+    double[] leafKernelLandingFromCoefficients(double[] tipRe, double[] tipIm, LandingTables tables,
+                                               double[][] sigma, double t, double[] ghatRe, double[] ghatIm,
+                                               double[] out, double[] im, double[] damping, double[] reset) {
+        requireLandingCovariance(sigma, "Diffusion covariance");
+        requireLandingTime(t);
+        requireLandingRate(tables.lambda);
+        requireLandingGhat(tables.lambda, ghatRe, ghatIm);
+        requireTables(tables, sigma, tables.lambda);
+        if (out != tipRe) System.arraycopy(tipRe, 0, out, 0, nTotal);
+        if (im != tipIm) System.arraycopy(tipIm, 0, im, 0, nTotal);
+        applyLanding(out, im, tables, t, ghatRe, ghatIm, damping, reset);
+        fftN(out, im, true);
+        return auditLandingGrid(out, false);
     }
 
     /**
@@ -1258,15 +1417,26 @@ public class TorusFourierKernel {
         requireLandingRate(lambda);
         requireLandingGhat(lambda, ghatRe, ghatIm);
         if (lambda == 0.0) return rootIntegral(partial);
-        final double[] re = partial.clone();
-        final double[] im = new double[nTotal];
+        return rootIntegralLanding(partial, landingTables(null, sigma, lambda), sigma, ghatRe, ghatIm,
+                new double[nTotal], new double[nTotal]);
+    }
+
+    /** rootIntegralLanding with tables for (sigma, lambda); re and im are scratch. */
+    double rootIntegralLanding(double[] partial, LandingTables tables, double[][] sigma,
+                               double[] ghatRe, double[] ghatIm, double[] re, double[] im) {
+        requireLandingArray(partial, nTotal, "partial");
+        requireLandingCovariance(sigma, "Diffusion covariance");
+        requireLandingRate(tables.lambda);
+        requireLandingGhat(tables.lambda, ghatRe, ghatIm);
+        requireTables(tables, sigma, tables.lambda);
+        if (tables.lambda == 0.0) return rootIntegral(partial);
+        System.arraycopy(partial, 0, re, 0, nTotal);
+        java.util.Arrays.fill(im, 0.0);
         fftN(re, im, false);
-        final double[] m = new double[dim];
+        final double[] weight = tables.weight;
         double sum = 0.0, compensation = 0.0;
         for (int idx = 0; idx < nTotal; idx++) {
-            modeOf(idx, m);
-            final double weight = lambda / (lambda + 0.5 * quadForm(sigma, m));
-            final double term = weight * (ghatRe[idx] * re[idx] - ghatIm[idx] * im[idx]);
+            final double term = weight[idx] * (ghatRe[idx] * re[idx] - ghatIm[idx] * im[idx]);
             final double adjusted = term - compensation;
             final double next = sum + adjusted;
             compensation = (next - sum) - adjusted;
