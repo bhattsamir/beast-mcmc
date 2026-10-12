@@ -4,16 +4,23 @@ import dr.evomodel.treedatalikelihood.continuous.TorusFourierTreeLikelihood.Jump
 import junit.framework.TestCase;
 
 /**
- * Pins the likelihood to the engine behind the published HA analysis (commit 838e4ebfb, the classes
+ * Pins the likelihood to the engine behind the paper's production runs (commit 838e4ebfb, the classes
  * of beast-torus-landing.jar, md5 29423c0535b945f109b845770385378d). Each scenario is a seeded chain
  * of one-evaluation proposals with store, accept and restore (TorusCacheFuzzTest.chainDigest), and its
  * expected value is the hash of every log-likelihood and every ancestral draw that engine produced on
  * the same chain. Any change to a single bit of any of them changes the hash.
  *
- * Run main() on a build to print the digests it produces. The scenarios avoid the configurations
- * where the published engine was wrong and this one deliberately differs: two evaluations between
- * store and restore, residues sharing a precision matrix, branch lengths that change without an
- * event, and non-positive-definite covariances.
+ * The digests depend on the last bit of Math.exp, sin, cos and log, which can differ between Java
+ * versions and processor architectures, so they are checked only on the platform that recorded them
+ * (Java 11 on x86_64). Elsewhere, copy this file and TorusCacheFuzzTest.java into a checkout of
+ * 838e4ebfb, run main() there and on this build, and compare.
+ * (On Java 8 x86_64 the two engines give identical digests, which differ from these in 7 of the 8
+ * scenarios.)
+ *
+ * The scenarios avoid the configurations where the two engines differ by design: two evaluations
+ * between store and restore, residues sharing a precision matrix, and branch lengths that change
+ * without an event. They also avoid non-positive-definite covariances, where both engines return NaN
+ * whose sign bit depends on the JIT.
  */
 public class TorusPaperEngineRegressionTest extends TestCase {
 
@@ -67,9 +74,9 @@ public class TorusPaperEngineRegressionTest extends TestCase {
         return new TorusCacheFuzzTest.Config[]{a, b, c, d, e, f, g, h};
     }
 
-    /** Digests of the published engine on scenarios() a..h, in order (main() run against
-     *  beast-torus-landing.jar, md5 29423c0535b945f109b845770385378d, on 12 Oct 2026). */
-    private static final long[] PUBLISHED = {
+    /** Digests of the paper engine on scenarios() a..h, in order (main() run against
+     *  beast-torus-landing.jar, md5 29423c0535b945f109b845770385378d, OpenJDK 11 on x86_64, 12 Oct 2026). */
+    private static final long[] PAPER_ENGINE = {
             0xcd083f9667f029e9L,   // a  landing, root moves
             0xa426c456b7f72176L,   // b  landing, 9 residues in parallel, branch rates
             0x75415b4e5f99c5bfL,   // c  shift, jumps, tip error, branch rates
@@ -80,18 +87,32 @@ public class TorusPaperEngineRegressionTest extends TestCase {
             0x1ed90257a661c6ffL,   // h  landing, nGrid 256
     };
 
-    public void testBitIdenticalToPublishedEngine() throws Exception {
+    /** True on the platform the digests were recorded on: Java 11 on x86_64. */
+    static boolean onRecordingPlatform() {
+        final String arch = System.getProperty("os.arch");
+        return "11".equals(System.getProperty("java.specification.version"))
+                && ("amd64".equals(arch) || "x86_64".equals(arch));
+    }
+
+    public void testBitIdenticalToPaperEngine() throws Exception {
+        if (!onRecordingPlatform()) {
+            System.err.println("TorusPaperEngineRegressionTest: the digests were recorded with Java 11 on x86_64 and are not"
+                    + " checked on Java " + System.getProperty("java.specification.version") + " on "
+                    + System.getProperty("os.arch") + ". To compare, copy this test and TorusCacheFuzzTest into a checkout of"
+                    + " 838e4ebfb and run main() there and on this build.");
+            return;
+        }
         final TorusCacheFuzzTest.Config[] scenarios = scenarios();
         int differing = 0;
         final StringBuilder report = new StringBuilder();
         for (int i = 0; i < scenarios.length; i++) {
             final long digest = TorusCacheFuzzTest.chainDigest(scenarios[i]);
-            if (digest != PUBLISHED[i]) {
+            if (digest != PAPER_ENGINE[i]) {
                 differing++;
-                report.append(String.format(" scenario %c: %016x, published engine %016x;", 'a' + i, digest, PUBLISHED[i]));
+                report.append(String.format(" scenario %c: %016x, paper engine %016x;", 'a' + i, digest, PAPER_ENGINE[i]));
             }
         }
-        assertEquals("differs from the published engine:" + report, 0, differing);
+        assertEquals("differs from the paper engine:" + report, 0, differing);
     }
 
     public static void main(String[] args) throws Exception {

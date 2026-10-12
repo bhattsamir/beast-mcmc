@@ -516,8 +516,8 @@ public class TorusFourierTest extends TestCase {
     // Sigma_eps had ZERO committed coverage, so a refactor could have removed it in silence.
     // Everything below is therefore an INDEPENDENT check, not a recorded engine output.
 
-    /** HA's tip observation error: 3.5 degrees isotropic, as a VARIANCE in radians^2. */
-    private static final double SIGMA_EPS_HA = 0.00373156339239;
+    /** A sharp tip observation error, 3.5 degrees isotropic (a test value), as a VARIANCE in radians^2. */
+    private static final double SIGMA_EPS_SHARP = 0.00373156339239;
 
     /**
      * (a) Two-tip cherry against its CLOSED FORM, with and without tip error.
@@ -525,7 +525,7 @@ public class TorusFourierTest extends TestCase {
      * On the torus the wrapped-normal tip messages convolve, so a cherry's marginal likelihood
      * under the flat root prior is exactly
      *     -d*log(2*pi) + log WN(yA - yB ; (tA + tB)*Sigma + 2*Sigma_eps),
-     * with Sigma_eps entering ONCE PER TIP. The Sigma_eps = 0 case reproduces the published
+     * with Sigma_eps entering ONCE PER TIP. The Sigma_eps = 0 case reproduces the
      * prototype value already asserted in testKernelTwoTip, which pins the normalisation
      * convention; the Sigma_eps > 0 cases are the actual test.
      */
@@ -537,13 +537,13 @@ public class TorusFourierTest extends TestCase {
         // convention anchor: same configuration and same number as testKernelTwoTip
         assertEquals(-6.69298747149, cherryClosedForm(yA, yB, sigma, tA, tB, 0.0), 1.0e-9);
 
-        for (double eps : new double[]{0.0, SIGMA_EPS_HA, Math.pow(5.0 * Math.PI / 180.0, 2)}) {
+        for (double eps : new double[]{0.0, SIGMA_EPS_SHARP, Math.pow(5.0 * Math.PI / 180.0, 2)}) {
             double engine = cherryLikelihood(tA, tB, yA, yB, sigma, eps, 64);
             assertEquals("Sigma_eps = " + eps + " rad^2",
                     cherryClosedForm(yA, yB, sigma, tA, tB, eps), engine, 1.0e-9);
         }
         // tip error must MOVE the answer -- a test that passes with Sigma_eps ignored is no test
-        assertTrue(Math.abs(cherryLikelihood(tA, tB, yA, yB, sigma, SIGMA_EPS_HA, 64)
+        assertTrue(Math.abs(cherryLikelihood(tA, tB, yA, yB, sigma, SIGMA_EPS_SHARP, 64)
                 - cherryLikelihood(tA, tB, yA, yB, sigma, 0.0, 64)) > 1.0e-4);
     }
 
@@ -572,13 +572,13 @@ public class TorusFourierTest extends TestCase {
         final double[] yA = {0.7, -1.3}, yB = {0.9, -1.1};
         final double tA = 1.0e-5, tB = 0.5;
 
-        double eps128 = cherryLikelihood(tA, tB, yA, yB, sigma, SIGMA_EPS_HA, 128);
-        double eps256 = cherryLikelihood(tA, tB, yA, yB, sigma, SIGMA_EPS_HA, 256);
-        double eps512 = cherryLikelihood(tA, tB, yA, yB, sigma, SIGMA_EPS_HA, 512);
+        double eps128 = cherryLikelihood(tA, tB, yA, yB, sigma, SIGMA_EPS_SHARP, 128);
+        double eps256 = cherryLikelihood(tA, tB, yA, yB, sigma, SIGMA_EPS_SHARP, 256);
+        double eps512 = cherryLikelihood(tA, tB, yA, yB, sigma, SIGMA_EPS_SHARP, 512);
         assertEquals("Sigma_eps arm must be converged by nGrid 256", eps128, eps256, 1.0e-6);
         assertEquals("Sigma_eps arm must be at machine precision by nGrid 512", eps256, eps512, 1.0e-12);
         assertEquals("converged value must be the closed form",
-                cherryClosedForm(yA, yB, sigma, tA, tB, SIGMA_EPS_HA), eps512, 1.0e-8);
+                cherryClosedForm(yA, yB, sigma, tA, tB, SIGMA_EPS_SHARP), eps512, 1.0e-8);
 
         double dirac256 = cherryLikelihood(tA, tB, yA, yB, sigma, 0.0, 256);
         double dirac512 = cherryLikelihood(tA, tB, yA, yB, sigma, 0.0, 512);
@@ -608,8 +608,8 @@ public class TorusFourierTest extends TestCase {
             } catch (TorusLogSpacePruning.AccuracyException expected) {
                 assertTrue(expected.getMessage().contains("resource cap"));
             }
-            double validated = cherryLikelihood(tA, tB, yA, yB, sigma, SIGMA_EPS_HA, 128);
-            assertEquals(cherryClosedForm(yA, yB, sigma, tA, tB, SIGMA_EPS_HA), validated, 1.0e-8);
+            double validated = cherryLikelihood(tA, tB, yA, yB, sigma, SIGMA_EPS_SHARP, 128);
+            assertEquals(cherryClosedForm(yA, yB, sigma, tA, tB, SIGMA_EPS_SHARP), validated, 1.0e-8);
         } finally {
             TorusFourierTreeLikelihood.setValidateEveryEvaluation(false);
         }
@@ -621,8 +621,8 @@ public class TorusFourierTest extends TestCase {
         final double[] yA = {0.4, 1.1}, yB = {-1.2, 0.6};
         assertTrue(cherryLikelihoodObject(0.7, 1.4, yA, yB, sigma, 0.0, 64).getReport()
                 .contains("SIGMA_EPS = NONE"));
-        String applied = cherryLikelihoodObject(0.7, 1.4, yA, yB, sigma, SIGMA_EPS_HA, 64).getReport();
-        assertTrue(applied, applied.contains("SIGMA_EPS = [" + SIGMA_EPS_HA));
+        String applied = cherryLikelihoodObject(0.7, 1.4, yA, yB, sigma, SIGMA_EPS_SHARP, 64).getReport();
+        assertTrue(applied, applied.contains("SIGMA_EPS = [" + SIGMA_EPS_SHARP));
     }
 
     /** Sigma_eps is a covariance: a negative variance would make the leaf damping factor

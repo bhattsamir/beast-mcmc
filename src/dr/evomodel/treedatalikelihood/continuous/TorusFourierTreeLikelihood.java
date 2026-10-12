@@ -189,9 +189,9 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     }
 
     // ---- branch lengths ----
-    // Every branch length is computed once per evaluation, on the calling thread, into branchLengths
-    // (the sweep reads them from there, so the tree and the rate model are not called from worker
-    // threads). A branch whose length differs bit for bit from the one the cached messages were built
+    // Every branch length is computed once per evaluation, on the calling thread, into branchLengths.
+    // Outside -Dtorus.validate the sweep reads them there: no worker evaluates a length or the rate model.
+    // A branch whose length differs bit for bit from the one the cached messages were built
     // with is flagged, whatever events were fired: the cache is then correct even under a model that
     // changes branch lengths without saying so (ScaledTreeLengthRateModel after a tree move, or a rate
     // event whose index is a parameter index rather than a node number). Correctly signalled changes

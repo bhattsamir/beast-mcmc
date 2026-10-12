@@ -41,7 +41,7 @@ import java.util.Random;
  *
  * {@link #chainDigest} runs the same kind of chain with one evaluation per proposal and returns a
  * hash of every value it produced; TorusPaperEngineRegressionTest pins those hashes to the values
- * the engine behind the published analysis produced.
+ * the paper engine (838e4ebfb) produced.
  */
 public class TorusCacheFuzzTest extends TestCase {
 
