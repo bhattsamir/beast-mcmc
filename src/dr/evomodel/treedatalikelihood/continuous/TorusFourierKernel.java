@@ -6,8 +6,6 @@
 
 package dr.evomodel.treedatalikelihood.continuous;
 
-import dr.math.FastFourierTransform;
-
 /**
  * FFT heat-kernel operations for Brownian diffusion on a flat d-dimensional torus
  * (-pi,pi]^d, discretised on a grid with nGrid points per axis (nGrid a power of
@@ -68,6 +66,119 @@ public class TorusFourierKernel {
             int s = 1;
             for (int k = ax + 1; k < dim; k++) s *= nGrid;
             stride[ax] = s;
+        }
+        // Bit-reversal transpositions and twiddle factors of FastFourierTransform.fft, tabulated once.
+        final java.util.List<int[]> swaps = new java.util.ArrayList<int[]>();
+        final int n = nGrid << 1;
+        int j = 1;
+        for (int i = 1; i < n; i += 2) {
+            if (j > i) swaps.add(new int[]{(i - 1) >> 1, (j - 1) >> 1});
+            int m = nGrid;
+            while (m >= 2 && j > m) {
+                j -= m;
+                m >>= 1;
+            }
+            j += m;
+        }
+        this.swapLow = new int[swaps.size()];
+        this.swapHigh = new int[swaps.size()];
+        for (int i = 0; i < swaps.size(); i++) {
+            swapLow[i] = swaps.get(i)[0];
+            swapHigh[i] = swaps.get(i)[1];
+        }
+        this.twiddleRe = new double[2][nGrid];
+        this.twiddleIm = new double[2][nGrid];
+        for (int direction = 0; direction < 2; direction++) {
+            fillTwiddles(direction == 1, twiddleRe[direction], twiddleIm[direction]);
+        }
+    }
+
+    // ---- planned FFT ----
+    // fftN applies FastFourierTransform.fft (Numerical Recipes four1) along every axis. Its plan
+    // reproduces that routine exactly: the same bit-reversal transpositions, and the twiddle factors
+    // four1 generates by its own trigonometric recurrence, run once per direction and tabulated
+    // (stage with half-span h at offsets h-1 .. 2h-2). Every butterfly is the same arithmetic, in
+    // the same order, on the same operands, so the output is identical to the last bit. What
+    // changes is the traversal: contiguous lines are transformed in place rather than copied
+    // through an interleaved buffer, and lines along a strided axis are gathered a few at a time
+    // into contiguous scratch, transformed there, and scattered back.
+    private final int[] swapLow, swapHigh;      // four1's bit-reversal transpositions, complex indices
+    private final double[][] twiddleRe;         // [0 forward, 1 inverse][h - 1 + q]
+    private final double[][] twiddleIm;
+    private static final int FFT_GATHER = 8;    // strided lines gathered per block (fastest at nGrid 256)
+
+    /** four1's twiddle recurrence, tabulated: exactly the (wr, wi) it uses at every butterfly. */
+    private void fillTwiddles(boolean inverse, double[] outRe, double[] outIm) {
+        final double radians = inverse ? 2.0 * Math.PI : -2.0 * Math.PI;
+        final int n = nGrid << 1;
+        int mmax = 2;
+        while (n > mmax) {
+            final int istep = mmax << 1;
+            final double theta = radians / mmax;
+            double wtemp = Math.sin(0.5 * theta);
+            final double wpr = -2.0 * wtemp * wtemp;
+            final double wpi = Math.sin(theta);
+            double wr = 1.0;
+            double wi = 0.0;
+            final int half = mmax >> 1;
+            for (int m = 1; m < mmax; m += 2) {
+                outRe[half - 1 + ((m - 1) >> 1)] = wr;
+                outIm[half - 1 + ((m - 1) >> 1)] = wi;
+                wtemp = wr;
+                wr += wr * wpr - wi * wpi;
+                wi += wi * wpr + wtemp * wpi;
+            }
+            mmax = istep;
+        }
+    }
+
+    /** four1 on the contiguous line re/im[base .. base + nGrid). */
+    private void fftLine(double[] re, double[] im, int base, double[] wRe, double[] wIm) {
+        for (int k = 0; k < swapLow.length; k++) {
+            final int a = base + swapLow[k], b = base + swapHigh[k];
+            final double tr = re[a];
+            re[a] = re[b];
+            re[b] = tr;
+            final double ti = im[a];
+            im[a] = im[b];
+            im[b] = ti;
+        }
+        final int end = base + nGrid;
+        for (int half = 1; half < nGrid; half <<= 1) {
+            final int step = half << 1;
+            for (int q = 0; q < half; q++) {
+                final double wr = wRe[half - 1 + q], wi = wIm[half - 1 + q];
+                for (int p = base + q; p < end; p += step) {
+                    final int p2 = p + half;
+                    final double tempr = wr * re[p2] - wi * im[p2];
+                    final double tempi = wr * im[p2] + wi * re[p2];
+                    re[p2] = re[p] - tempr;
+                    im[p2] = im[p] - tempi;
+                    re[p] += tempr;
+                    im[p] += tempi;
+                }
+            }
+        }
+    }
+
+    /** four1 on the `width` adjacent strided lines base + c + j*s (c < width, j < nGrid): gather
+     *  them into contiguous scratch, transform each as a contiguous line, scatter them back. */
+    private void fftStrided(double[] re, double[] im, int base, int s, int width,
+                            double[] scratchRe, double[] scratchIm, double[] wRe, double[] wIm) {
+        for (int j = 0; j < nGrid; j++) {
+            final int src = base + j * s;
+            for (int c = 0; c < width; c++) {
+                scratchRe[c * nGrid + j] = re[src + c];
+                scratchIm[c * nGrid + j] = im[src + c];
+            }
+        }
+        for (int c = 0; c < width; c++) fftLine(scratchRe, scratchIm, c * nGrid, wRe, wIm);
+        for (int j = 0; j < nGrid; j++) {
+            final int dst = base + j * s;
+            for (int c = 0; c < width; c++) {
+                re[dst + c] = scratchRe[c * nGrid + j];
+                im[dst + c] = scratchIm[c * nGrid + j];
+            }
         }
     }
 
@@ -822,26 +933,27 @@ public class TorusFourierKernel {
         return s / nTotal;
     }
 
-    /* N-D FFT: in-house 1-D four1 applied along each axis (strided lines), with
-     * the inverse divided by nTotal (four1 itself is unnormalised). */
+    /* N-D FFT: the 1-D four1 of FastFourierTransform.fft applied along each axis, with the
+     * inverse divided by nTotal (four1 itself is unnormalised). Planned and blocked, see
+     * fillTwiddles; the result is bit-identical to calling FastFourierTransform.fft line by line. */
     private void fftN(double[] re, double[] im, boolean inverse) {
-        final double[] buf = new double[2 * nGrid];
+        final double[] wRe = twiddleRe[inverse ? 1 : 0];
+        final double[] wIm = twiddleIm[inverse ? 1 : 0];
+        double[] scratchRe = null, scratchIm = null;
         for (int ax = 0; ax < dim; ax++) {
             final int s = stride[ax];
             final int outer = nTotal / (nGrid * s);
+            if (s > 1 && scratchRe == null) {
+                scratchRe = new double[FFT_GATHER * nGrid];
+                scratchIm = new double[FFT_GATHER * nGrid];
+            }
             for (int o = 0; o < outer; o++) {
-                for (int innr = 0; innr < s; innr++) {
-                    final int base = o * nGrid * s + innr;
-                    for (int j = 0; j < nGrid; j++) {
-                        final int p = base + j * s;
-                        buf[2 * j] = re[p];
-                        buf[2 * j + 1] = im[p];
-                    }
-                    FastFourierTransform.fft(buf, nGrid, inverse);
-                    for (int j = 0; j < nGrid; j++) {
-                        final int p = base + j * s;
-                        re[p] = buf[2 * j];
-                        im[p] = buf[2 * j + 1];
+                final int base = o * nGrid * s;
+                if (s == 1) {
+                    fftLine(re, im, base, wRe, wIm);
+                } else {
+                    for (int c = 0; c < s; c += FFT_GATHER) {
+                        fftStrided(re, im, base + c, s, Math.min(FFT_GATHER, s - c), scratchRe, scratchIm, wRe, wIm);
                     }
                 }
             }
