@@ -351,6 +351,10 @@ public class TorusFourierKernel {
      * bit-for-bit the original arithmetic.
      */
     public double[] leafKernel(double[] y, double[][] sigma, double t, double[][] sigmaEps) {
+        final double[] bm = transferMultiplier(sigma, t, 0.0, null);
+        if (!brownianSpectralHalfVanishes(y, t, bm, sigmaEps)) {
+            return leafKernelSplit(y, sigma, t, 0.0, bm, null, sigmaEps);
+        }
         // Without jumps the spectral half of leafKernelSplit is identically zero: its multiplier is
         // the Brownian one minus itself (weight e^{-0 t} = 1), so the inverse FFT returns signed
         // zeros, which the clamp keeps and the atom then overwrites exactly as it would a plain zero.
@@ -360,6 +364,26 @@ public class TorusFourierKernel {
         addLatticeAtom(re, y, sigma, t, -lamT, sigmaEps);
         for (int k = 0; k < nTotal; k++) if (re[k] < MIN_POS) re[k] = MIN_POS;
         return re;
+    }
+
+    /**
+     * Whether leafKernelSplit's spectral half is exactly signed zeros for a Brownian tip: true when
+     * t and y are finite, every Brownian multiplier is finite (x - 1.0*x = +0.0) and so is every
+     * tip-error damping factor (0 * finite = +-0). A non-positive-definite Sigma or Sigma_eps can
+     * overflow them, and the spectral half is then NaN, which the shortcut must not hide.
+     */
+    private boolean brownianSpectralHalfVanishes(double[] y, double t, double[] bm, double[][] sigmaEps) {
+        if (!Double.isFinite(t)) return false;
+        for (double v : y) if (!Double.isFinite(v)) return false;
+        for (double v : bm) if (!Double.isFinite(v)) return false;
+        if (sigmaEps != null) {
+            final double[] m = new double[dim];
+            for (int idx = 0; idx < nTotal; idx++) {
+                for (int ax = 0; ax < dim; ax++) m[ax] = modeValue[ax][idx];
+                if (!Double.isFinite(Math.exp(-0.5 * quadForm(sigmaEps, m)))) return false;
+            }
+        }
+        return true;
     }
 
 
@@ -454,7 +478,9 @@ public class TorusFourierKernel {
         // exceeds the smallest by more than SCREEN_GAP plus a bound on the rounding of both the screen
         // and the direct form (a relative 1e-12 of sum|A_ij| * reach^2, thousands of times the
         // worst-case rounding). Every other image is evaluated exactly as before, in the same order,
-        // so the result is unchanged to the last bit. Non-finite values never pass the test.
+        // so the result is unchanged to the last bit. The screen is used only where none of its terms
+        // can overflow: each is bounded by about 3 * sum|A_ij| * reach^2, so above 1e300 (covariances
+        // near 1e-305 rad^2), or for any non-finite input, gap is infinite and every image is evaluated.
         final double[][] shift = new double[combos][dim];
         final double[] shiftForm = new double[combos];
         double maxAbsY = 0.0;
@@ -481,7 +507,8 @@ public class TorusFourierKernel {
             shiftForm[c] = form;
         }
         final double reach = TWO_PI + maxAbsY + TWO_PI * kmax;
-        final double gap = SCREEN_GAP + 1.0e-12 * invSum * reach * reach;
+        final double magnitude = invSum * reach * reach;
+        final double gap = magnitude < 1.0e300 ? SCREEN_GAP + 1.0e-12 * magnitude : Double.POSITIVE_INFINITY;
         final double[] b = new double[dim];
         final double[] ab = new double[dim];
         final double[] d = new double[dim];

@@ -173,4 +173,111 @@ public class TorusAtomScreeningTest extends TestCase {
         assertTrue(cases > 300);
         assertTrue(skippedSomewhere > 50);
     }
+
+    /**
+     * Covariances near 1e-306 rad^2, where the screen's quadratic forms overflow: screening must switch
+     * itself off and the sum must equal the exhaustive one bit for bit, NaN and infinite cells included.
+     * The first case is the one the review found (screened: MIN_POS at cell 61, exhaustive: 1.56e305).
+     */
+    public void testOverflowRegimeIsBitIdentical() throws Exception {
+        final Method atom = TorusFourierKernel.class.getDeclaredMethod("addLatticeAtom", double[].class,
+                double[].class, double[][].class, double.class, double.class, double[][].class);
+        final Method inverse = TorusFourierKernel.class.getDeclaredMethod("symmetricInverse", double[][].class,
+                double[][].class);
+        atom.setAccessible(true);
+        inverse.setAccessible(true);
+        final Random rng = new Random(306L);
+        int cases = 0;
+        for (int rep = 0; rep < 400; rep++) {
+            final int dim = rep == 0 ? 2 : 1 + rng.nextInt(2);
+            final int nGrid = 8;
+            final TorusFourierKernel kernel = new TorusFourierKernel(dim, nGrid);
+            final int n = kernel.getGridCount();
+            final double[][] sigma;
+            final double[] y = new double[dim];
+            if (rep == 0) {
+                sigma = new double[][]{{1.1842461248098172e-306, -7.007203203054595e-308},
+                        {-7.007203203054595e-308, 8.831981323964145e-307}};
+                y[0] = -0.7853981633974483;
+                y[1] = -2.356194490192345;
+            } else {
+                final double scale = Math.pow(10.0, -308 + 10 * rng.nextDouble());
+                sigma = covariance(rng, dim, scale, scale * 100.0, dim == 2 ? 0.9 * (2 * rng.nextDouble() - 1) : Double.NaN);
+                for (int ax = 0; ax < dim; ax++) {   // on a grid point or its winding image, where q = 0 exactly
+                    y[ax] = TWO_PI * rng.nextInt(nGrid) / nGrid - (rng.nextBoolean() ? TWO_PI : 0.0);
+                }
+            }
+            final double[] got = new double[n], want = new double[n];
+            Throwable gotFailure = null, wantFailure = null;
+            try {
+                atom.invoke(kernel, got, y, sigma, 1.0, 0.0, null);
+            } catch (java.lang.reflect.InvocationTargetException e) {
+                gotFailure = e.getCause();
+            }
+            try {
+                reference(kernel, inverse, dim, nGrid, want, y, sigma, 1.0, 0.0, null);
+            } catch (java.lang.reflect.InvocationTargetException e) {
+                wantFailure = e.getCause();
+            }
+            assertEquals("case " + rep + " failure", String.valueOf(wantFailure), String.valueOf(gotFailure));
+            if (gotFailure != null) continue;
+            for (int i = 0; i < n; i++) {
+                assertEquals("case " + rep + " cell " + i + ": screened " + got[i] + " exhaustive " + want[i],
+                        Double.doubleToRawLongBits(want[i]), Double.doubleToRawLongBits(got[i]));
+            }
+            cases++;
+        }
+        System.out.println("  overflow regime: " + cases + " cases identical");
+        assertTrue(cases > 100);
+    }
+
+    /**
+     * The Brownian tip without jumps skips leafKernelSplit's spectral half, which is signed zeros only
+     * when every multiplier and damping factor is finite. Compare it with the split path (the jump
+     * overload at rate zero) for valid and invalid inputs: non-positive-definite Sigma or Sigma_eps,
+     * overflowing forms, and non-finite angles or times. Values and failures must agree exactly.
+     */
+    public void testBrownianTipShortcutMatchesSplitPath() throws Exception {
+        final Random rng = new Random(77L);
+        int cases = 0;
+        for (int rep = 0; rep < 300; rep++) {
+            final int dim = 1 + rng.nextInt(2);
+            final TorusFourierKernel kernel = new TorusFourierKernel(dim, dim == 1 ? 256 : 32);
+            final double[][] sigma = covariance(rng, dim, 0.01, 2.0, Double.NaN);
+            double[][] eps = rng.nextBoolean() ? null : covariance(rng, dim, 0.001, 0.3, Double.NaN);
+            final double[] y = new double[dim];
+            for (int ax = 0; ax < dim; ax++) y[ax] = Math.PI * (2 * rng.nextDouble() - 1);
+            double t = Math.pow(10.0, -3 + 3 * rng.nextDouble());
+            switch (rep % 8) {
+                case 1: sigma[0][0] = -sigma[0][0]; break;                       // Sigma not positive definite
+                case 2: if (eps != null) eps[0][0] = -eps[0][0]; else eps = new double[dim][dim]; break;
+                case 3: for (double[] row : sigma) for (int j = 0; j < dim; j++) row[j] *= -1e3; break;
+                case 4: y[0] = rng.nextBoolean() ? Double.POSITIVE_INFINITY : Double.NaN; break;
+                case 5: t = rng.nextBoolean() ? Double.POSITIVE_INFINITY : Double.NaN; break;
+                case 6: for (double[] row : sigma) for (int j = 0; j < dim; j++) row[j] *= 1e300; break;
+                default: break;                                                   // valid inputs
+            }
+            double[] got = null, want = null;
+            Throwable gotFailure = null, wantFailure = null;
+            try {
+                got = kernel.leafKernel(y, sigma, t, eps);
+            } catch (RuntimeException e) {
+                gotFailure = e;
+            }
+            try {
+                want = kernel.leafKernel(y, sigma, t, 0.0, (double[][]) null, eps);
+            } catch (RuntimeException e) {
+                wantFailure = e;
+            }
+            assertEquals("case " + rep + " failure", String.valueOf(wantFailure), String.valueOf(gotFailure));
+            if (want == null) continue;
+            for (int i = 0; i < want.length; i++) {
+                assertEquals("case " + rep + " (kind " + rep % 8 + ") cell " + i + ": shortcut " + got[i] + " split " + want[i],
+                        Double.doubleToRawLongBits(want[i]), Double.doubleToRawLongBits(got[i]));
+            }
+            cases++;
+        }
+        System.out.println("  Brownian tip shortcut: " + cases + " cases identical to the split path");
+        assertTrue(cases > 150);
+    }
 }
