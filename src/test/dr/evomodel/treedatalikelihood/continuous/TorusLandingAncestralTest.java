@@ -96,8 +96,8 @@ public class TorusLandingAncestralTest extends TestCase {
      * missing the posterior means by 0.52 rad.
      */
     public void testFftAncestralSamplerMatchesDirectJointQuadrature() throws Exception {
-        final String previous = System.getProperty("torus.landing.denseAncestral");
-        System.clearProperty("torus.landing.denseAncestral");
+        final String previous = System.getProperty("torus.ancestral.reference");
+        System.clearProperty("torus.ancestral.reference");
         try {
             Tree tree = tree();
             TorusFourierTreeLikelihood like = likelihood(tree, 1, new Parameter.Default(RATE),
@@ -121,8 +121,8 @@ public class TorusLandingAncestralTest extends TestCase {
             assertEquals("child E[cos]", expected[3], cc, 0.025);
             assertEquals("child E[sin]", expected[4], cs, 0.025);
         } finally {
-            if (previous == null) System.clearProperty("torus.landing.denseAncestral");
-            else System.setProperty("torus.landing.denseAncestral", previous);
+            if (previous == null) System.clearProperty("torus.ancestral.reference");
+            else System.setProperty("torus.ancestral.reference", previous);
         }
     }
 

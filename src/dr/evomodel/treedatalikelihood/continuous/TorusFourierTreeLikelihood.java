@@ -25,8 +25,11 @@ import java.util.logging.Logger;
  * observation error Sigma_eps (see {@code sigmaEpsilon}); with Sigma_eps absent or zero
  * they are Dirac point observations for shift; landing requires positive Sigma_eps.
  * Optional per-evaluation validation uses a positive reference for the selected law;
- * the reference result replaces an inaccurate FFT likelihood. Ancestral logging
- * builds that law's positive reference on demand and draws jointly from its partials.
+ * the reference result replaces an inaccurate FFT likelihood. Ancestral logging draws
+ * internal states jointly by a downward pass over the cached FFT partials, with the
+ * zero-jump half of every branch kernel evaluated exactly in real space (see
+ * TorusFourierKernel, "ancestral sampling"); when a positive reference is present, as under
+ * validation, draws come from that reference instead.
  *
  * <p>Partial likelihoods are cached per node and per residue, following BEAST's
  * standard tree-likelihood scheme (cf. {@code AbstractTreeLikelihood} /
@@ -64,6 +67,13 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     // requested Fourier discretisation, including signed truncation tails, so its
     // values agree with the standalone used to calibrate practical grid sizes.
     private final boolean strictLandingNumerics = Boolean.getBoolean("torus.landing.strict");
+    private final java.util.concurrent.atomic.AtomicLong landingUndefinedEvaluations =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicBoolean landingUndefinedWarning =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /** Residue evaluations whose landing root integral was non-positive at this nGrid (returned -inf). */
+    public long getLandingUndefinedEvaluations() { return landingUndefinedEvaluations.get(); }
     private final java.util.concurrent.atomic.AtomicBoolean landingResolutionWarning =
             new java.util.concurrent.atomic.AtomicBoolean();
     // Compound-Poisson jump, shared across residues: sampled rate lambda (jumpRate) and a FIXED
@@ -136,6 +146,27 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     public static boolean isValidateEveryEvaluation() {
         return validateEveryEvaluation;
     }
+
+    /**
+     * Ancestral sampling source. By default internal states come from the split FFT downward
+     * pass: one O(g^2 log g) step per node, usable at production scale, drawing from the same
+     * posterior the FFT likelihood defines. If a positive reference already exists for a
+     * residue (per-evaluation validation builds one), draws come from it, so they follow the
+     * likelihood the chain accepted. -Dtorus.ancestral.reference=true forces the positive
+     * reference (small trees only: it is O(g^4) per edge). An UNRESOLVED draw -- one resting on
+     * partial values below the FFT's dynamic range -- warns once; -Dtorus.ancestral.strict=true
+     * makes it an error.
+     */
+    private static boolean ancestralReferenceForced() {
+        return Boolean.getBoolean("torus.ancestral.reference");
+    }
+
+    private static boolean ancestralStrict() {
+        return Boolean.getBoolean("torus.ancestral.strict");
+    }
+
+    private final java.util.concurrent.atomic.AtomicBoolean ancestralResolutionWarning =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
 
     private final TorusLogSpacePruning.Result[] stableResults;
     private final TorusLogSpacePruning.Result[] storedStableResults;
@@ -639,10 +670,30 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
                             ? fft : reference.logLikelihood;
                 } else {
                     if (!Double.isFinite(fft)) {
-                        throw new ArithmeticException("Invalid landing root integral for residue " + r
-                                + " at nGrid=" + kernel.getGridSize() + "; check grid convergence and covariance conditioning");
+                        // The root integral is non-positive or non-finite: at this nGrid the
+                        // landing likelihood is UNDEFINED for this parameter value (Fourier
+                        // truncation makes the root mass ring negative). Throwing here would kill
+                        // an MCMC thread on an ordinary proposal; instead return -inf so the move
+                        // is rejected -- what the shift path already does for an unusable FFT
+                        // state, and the BEAST convention. The posterior is thereby restricted to
+                        // the region the chosen grid can evaluate; every occurrence is counted.
+                        if (strictLandingNumerics) {
+                            throw new ArithmeticException("Invalid landing root integral for residue " + r
+                                    + " at nGrid=" + kernel.getGridSize()
+                                    + "; check grid convergence and covariance conditioning");
+                        }
+                        landingUndefinedEvaluations.incrementAndGet();
+                        if (landingUndefinedWarning.compareAndSet(false, true)) {
+                            Logger.getLogger("dr.evomodel").warning("TorusFourierTreeLikelihood '" + getId()
+                                    + "': landing likelihood undefined (non-positive root integral) for residue "
+                                    + r + " at nGrid=" + kernel.getGridSize() + "; returning -inf so the state is"
+                                    + " rejected. Further occurrences are counted, not logged"
+                                    + " (getLandingUndefinedEvaluations); -Dtorus.landing.strict=true throws instead.");
+                        }
+                        acceptedResidueLogL[r] = Double.NEGATIVE_INFINITY;
+                    } else {
+                        acceptedResidueLogL[r] = fft;
                     }
-                    acceptedResidueLogL[r] = fft;
                     landingStableResults[r] = null;
                 }
                 stableResults[r] = null;
@@ -732,21 +783,16 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
     }
 
     /**
-     * Joint downward sample of residue r's internal angles under the landing law, reusing the
-     * FFT partials the upward pass already cached.
-     *
-     * The dense positive reference cannot serve production: on the 225-taxon HA tree at
-     * nGrid 128 it needs 6.0e10 operations per residue per logged state and its cost guard
-     * rejects that, while at the grids where it does fit its quadrature does not converge. It
-     * remains the small-tree validator; -Dtorus.landing.denseAncestral=true forces it.
-     *
-     * Root is drawn from (stationary landing law x root partial). Each internal child is then
-     * drawn from its conditional given the sampled parent CELL, which is the two-component
-     * landing mixture -- no-jump diffusion indexed by integer cell displacement, plus an
-     * absolute reset term -- weighted by that child's cached subtree partial.
+     * Joint downward sample of residue r's internal angles under the LANDING law from the
+     * cached FFT partials. The root is drawn from (stationary landing law x root partial); each
+     * internal child is drawn given its parent cell from
+     *     [ e^{-lambda t} WN(child - parent; t Sigma) + (1 - e^{-lambda t}) r_t(child) ] x childPartial,
+     * with the zero-jump wrapped normal evaluated EXACTLY (winding sum) and the broad reset law
+     * r_t on the FFT. The dense positive reference (TorusLandingPruning, O(g^4) per edge) is used
+     * when already present or forced; it cannot serve real trees at production grids.
      */
     private void sampleAncestralLanding(int r) {
-        if (Boolean.getBoolean("torus.landing.denseAncestral")) {
+        if (landingStableResults[r] != null || ancestralReferenceForced()) {
             if (landingStableResults[r] == null) {
                 landingStableResults[r] = landingReference(r, invertPrecision(precisions.get(r)),
                         jumpRate.getParameterValue(jumpRate.getDimension() == 1 ? 0 : r),
@@ -759,20 +805,19 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
         final double lambda = jumpRate.getParameterValue(jumpRate.getDimension() == 1 ? 0 : r);
         final NodeRef root = tree.getRoot();
         final int rootNumber = root.getNumber();
+        requireUsableFftPartials(r, rootNumber);
         java.util.Arrays.fill(sampledAnc[r], null);
+        final long unresolvedBefore = kernel.getAncestralUnresolvedDraws();
 
         final double[] stationary = kernel.landingStationaryDensity(
                 sigma, lambda, landingGhatRe, landingGhatIm);
         final int rootCell = kernel.sampleFromProduct(
                 stationary, partials[currentIndex[r][rootNumber]][r][rootNumber],
                 dr.math.MathUtils.nextDouble());
-        if (rootCell < 0) {
-            throw new ArithmeticException("Landing ancestral sampling found no positive mass at the"
-                    + " root for residue " + r + " at nGrid=" + kernel.getGridSize()
-                    + "; the grid does not resolve this conditional");
-        }
+        if (rootCell < 0) throw noAncestralMass("the root", r);
         sampledAnc[r][rootNumber] = kernel.anglesAt(rootCell);
         sampleLandingChildren(r, root, rootCell, sigma, lambda);
+        checkAncestralResolution(r, unresolvedBefore);
     }
 
     /** Draw every internal descendant of `node`, given that `node` was sampled into `parentCell`. */
@@ -784,17 +829,17 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             final int cn = child.getNumber();
             final double t = branchLength(child);
             final double noJump = Math.exp(-lambda * t);
-            final double[] diffusion = kernel.landingDiffusionKernel(sigma, t);
-            final double[] reset = (1.0 - noJump) > 0.0
-                    ? kernel.landingResetDensity(sigma, t, lambda, landingGhatRe, landingGhatIm)
-                    : null;
-            final int cell = kernel.sampleLandingChildCell(diffusion, reset, noJump, parentCell,
-                    partials[currentIndex[r][cn]][r][cn], dr.math.MathUtils.nextDouble());
-            if (cell < 0) {
-                throw new ArithmeticException("Landing ancestral sampling found no positive mass at"
-                        + " node " + cn + " for residue " + r + " at nGrid=" + kernel.getGridSize()
-                        + "; the grid does not resolve this conditional");
+            final double jumpProbability = -Math.expm1(-lambda * t);
+            final double[] diffusion = kernel.branchDiffusionKernel(sigma, t);
+            for (int k = 0; k < n2; k++) diffusion[k] *= noJump;
+            double[] reset = null;
+            if (jumpProbability > 0.0) {
+                reset = kernel.landingResetDensity(sigma, t, lambda, landingGhatRe, landingGhatIm);
+                for (int k = 0; k < n2; k++) reset[k] *= jumpProbability;
             }
+            final int cell = kernel.sampleChildCell(diffusion, reset, parentCell,
+                    partials[currentIndex[r][cn]][r][cn], dr.math.MathUtils.nextDouble());
+            if (cell < 0) throw noAncestralMass("node " + cn, r);
             sampledAnc[r][cn] = kernel.anglesAt(cell);
             sampleLandingChildren(r, child, cell, sigma, lambda);
         }
@@ -981,16 +1026,96 @@ public class TorusFourierTreeLikelihood extends AbstractModelLikelihood implemen
             sampleAncestralLanding(r);
             return;
         }
-        // Always sample from the accepted positive quadrature, including directed
-        // jumps. FFT tail clipping must not leak into ancestral conditionals. With
-        // per-evaluation validation off, that reference is built here on demand, so its
-        // cost is paid only when ancestral states are actually requested.
-        if (stableResults[r] == null) {
-            stableResults[r] = TorusLogSpacePruning.calculate(
-                    tree, this::branchLength, tipData[r], invertPrecision(precisions.get(r)),
-                    jumpRateValue(r), jumpW, jumpD, jumpS, sigmaEpsilonMatrix());
+        if (stableResults[r] != null || ancestralReferenceForced()) {
+            if (stableResults[r] == null) {
+                stableResults[r] = TorusLogSpacePruning.calculate(
+                        tree, this::branchLength, tipData[r], invertPrecision(precisions.get(r)),
+                        jumpRateValue(r), jumpW, jumpD, jumpS, sigmaEpsilonMatrix());
+            }
+            stableResults[r].sample(sampledAnc[r]);
+            return;
         }
-        stableResults[r].sample(sampledAnc[r]);
+        sampleAncestralShift(r);
+    }
+
+    /**
+     * Joint downward sample of residue r's internal angles under the SHIFT law from the cached
+     * FFT partials. The stationary law of a wrapped Levy process is uniform, so the root is drawn
+     * from its partial alone; each internal child is drawn given its parent cell from
+     * [e^{-lambda t} WN(t Sigma) + D_t](child - parent) * childPartial.
+     */
+    private void sampleAncestralShift(int r) {
+        final double[][] sigma = invertPrecision(precisions.get(r));
+        final double jr = jumpRateValue(r);
+        double[] psiRe = null, psiIm = null;
+        if (jr > 0.0 && jumpS != null) {
+            psiRe = new double[n2];
+            psiIm = new double[n2];
+            kernel.computePsiComplex(sigma, jr, jumpW, jumpD, jumpS, psiRe, psiIm);
+        }
+        final NodeRef root = tree.getRoot();
+        final int rn = root.getNumber();
+        requireUsableFftPartials(r, rn);
+        java.util.Arrays.fill(sampledAnc[r], null);
+        final long unresolvedBefore = kernel.getAncestralUnresolvedDraws();
+        final int rootCell = kernel.sampleFromProduct(flatLeaf, partials[currentIndex[r][rn]][r][rn],
+                dr.math.MathUtils.nextDouble());
+        if (rootCell < 0) throw noAncestralMass("the root", r);
+        sampledAnc[r][rn] = kernel.anglesAt(rootCell);
+        sampleShiftChildren(r, root, rootCell, sigma, jr, psiRe, psiIm);
+        checkAncestralResolution(r, unresolvedBefore);
+    }
+
+    private void sampleShiftChildren(int r, NodeRef node, int parentCell, double[][] sigma,
+                                     double jr, double[] psiRe, double[] psiIm) {
+        for (int c = 0; c < tree.getChildCount(node); c++) {
+            final NodeRef child = tree.getChild(node, c);
+            if (tree.isExternal(child)) continue;          // tips are observed, never sampled
+            final int cn = child.getNumber();
+            final double t = branchLength(child);
+            final double[] transition = kernel.branchDiffusionKernel(sigma, t);
+            final double[] jump = kernel.shiftJumpKernel(sigma, t, jr, psiRe, psiIm);
+            if (jump != null) {
+                final double noJump = Math.exp(-jr * t);
+                for (int k = 0; k < n2; k++) transition[k] = noJump * transition[k] + jump[k];
+            }
+            final int cell = kernel.sampleChildCell(transition, null, parentCell,
+                    partials[currentIndex[r][cn]][r][cn], dr.math.MathUtils.nextDouble());
+            if (cell < 0) throw noAncestralMass("node " + cn, r);
+            sampledAnc[r][cn] = kernel.anglesAt(cell);
+            sampleShiftChildren(r, child, cell, sigma, jr, psiRe, psiIm);
+        }
+    }
+
+    /** The FFT partials are a usable sampling basis only if no node's product underflowed
+     *  (a failed node leaves a flat placeholder buffer and a -inf scale that reaches the root). */
+    private void requireUsableFftPartials(int r, int rootNumber) {
+        if (!Double.isFinite(nodeLogScale[r][rootNumber])) {
+            throw new ArithmeticException("Ancestral sampling for residue " + r + ": the FFT partials"
+                    + " are not usable (a node product underflowed at nGrid=" + kernel.getGridSize()
+                    + "); enable -Dtorus.validate=true or -Dtorus.ancestral.reference=true");
+        }
+    }
+
+    private ArithmeticException noAncestralMass(String where, int r) {
+        return new ArithmeticException("Ancestral sampling found no positive mass at " + where
+                + " for residue " + r + " at nGrid=" + kernel.getGridSize()
+                + "; the grid does not resolve this conditional");
+    }
+
+    /** An unresolved draw rests on partial values below the FFT's dynamic range (J2 regime). */
+    private void checkAncestralResolution(int r, long unresolvedBefore) {
+        if (kernel.getAncestralUnresolvedDraws() == unresolvedBefore) return;
+        final String message = "Ancestral draw for residue " + r + " relies on partial values below"
+                + " the FFT's ~16-decade dynamic range at nGrid=" + kernel.getGridSize()
+                + "; this state lies outside the production path's operating range";
+        if (ancestralStrict()) throw new TorusLogSpacePruning.AccuracyException(message);
+        if (ancestralResolutionWarning.compareAndSet(false, true)) {
+            Logger.getLogger("dr.evomodel").warning("TorusFourierTreeLikelihood '" + getId() + "': "
+                    + message + ". Further occurrences are counted, not logged"
+                    + " (TorusFourierKernel.getAncestralUnresolvedDraws); use"
+                    + " -Dtorus.ancestral.strict=true to reject them.");
+        }
     }
 
 
