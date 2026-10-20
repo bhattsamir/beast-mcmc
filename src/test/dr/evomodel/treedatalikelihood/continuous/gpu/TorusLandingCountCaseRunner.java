@@ -158,8 +158,8 @@ public final class TorusLandingCountCaseRunner {
                         d(lambda), d(sigma[0][0]), d(sigma[0][1]), d(sigma[1][0]), d(sigma[1][1]), Integer.toString(n),
                         d(r.logL), "NaN", d(r.k0), d(neg), Long.toString(r.nPanels), Long.toString(r.nTerms),
                         Integer.toString(r.status), d(r.secInside), d(r.secTotal)));
-                System.out.println(String.format(Locale.ROOT, "%s eval %d: logL %.12g, k0 %.1e, changes %.6g, panels %d, terms %d, %.2f s",
-                        name, e, r.logL, r.k0, changes(r.N), r.nPanels, r.nTerms, r.secTotal));
+                System.out.println(String.format(Locale.ROOT, "%s eval %d: logL %.12g, k0 %.1e, changes %.6g, panels %d, terms %d, %.2f s [model %.2f inside %.2f launch %.2f sync %.2f cross %.2f = plan %.2f upload %.2f launch %.2f wait %.2f]",
+                        name, e, r.logL, r.k0, changes(r.N), r.nPanels, r.nTerms, r.secTotal, r.secModel, r.secInside, r.secLaunch, r.secSync, r.secCross, r.secPlan, r.secUpload, r.secKernel, r.secWait));
             }
         } finally {
             for (TorusLandingCountEngine eng : engines.values()) eng.close();

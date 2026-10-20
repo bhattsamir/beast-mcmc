@@ -113,6 +113,8 @@ public final class TorusLandingCountEngine implements AutoCloseable {
         public long nPanels, nTerms;
         public int status;
         public double secInside, secTotal;
+        /** host-side breakdown (seconds): model + sort, outside launches, waits at the plan sync, host plan, cross */
+        public double secModel, secLaunch, secSync, secPlan, secCross, secUpload, secKernel, secWait;
     }
 
     private final int n, N, S, nodeCount, root, nResidues, ntile, nb, nbs, maxUnits;
@@ -143,14 +145,20 @@ public final class TorusLandingCountEngine implements AutoCloseable {
     private final CUdeviceptr dLam, dMu, dIdx, dWts, dLs, dMus, dRhoS, dGamG;
     private final CUdeviceptr dLt, dC, dOut, dProd, dW, dXw, dXc, dXo;
     private final CUdeviceptr dAR, dBR, dFlags, dTileCnt, dTileOff, dTot, dLcA, dRcA, dLcB, dRcB;
-    private final CUdeviceptr dPart, dScal, dOpScale, dThr, dPlan;
-    private final CUdeviceptr dUnits, dNodes, dUfirst, dUcount, dWs, dNq, dPartial, dAlpha, dX;
+    private final CUdeviceptr dPart, dScal, dOpScale, dThr, dPlan, dRB;
+    private final CUdeviceptr dUp, dUnits, dNodes, dUfirst, dUcount, dWs, dNq, dPartial, dAlpha, dXall;
+    private final java.nio.ByteBuffer up;               // host image of dUp (one upload per branch)
     private final CUdeviceptr nullPtr = new CUdeviceptr();
     private boolean closed = false;
 
     // scalar slots in dScal
     private static final int SC_SC = 0, SC_DOT = 1, SC_ZB = 2, SC_SUMS = 4, SC_TAU = SC_SUMS + 4 * KMAX,
             SC_L = SC_TAU + 2, SC_PI = SC_L + 2, NSCAL = SC_PI + 2 * KMAX;
+    // the per-branch readback region dRB: plan of side A, plan of side B, the scalars, Wh(0) (one copy per branch)
+    private static final int PL = 2 + 2 * NC, RB_SCAL = 2 * PL, RB_WH0 = RB_SCAL + NSCAL + (NSCAL & 1), RB_N = RB_WH0 + 2;
+    // the per-branch upload dUp: Gauss-Legendre nodes, weights, unit ranges, orders, then the work units (int4)
+    private static final int UP_NODES = 0, UP_WS = UP_NODES + 8 * PMAX * 2 * NQMAX, UP_UFIRST = UP_WS + 8 * PMAX * NQMAX,
+            UP_UCOUNT = UP_UFIRST + 4 * PMAX * 2, UP_NQ = UP_UCOUNT + 4 * PMAX * 2, UP_UNITS = UP_NQ + 4 * PMAX;
 
     /**
      * @param n        grid points per axis (power of two)
@@ -346,19 +354,23 @@ public final class TorusLandingCountEngine implements AutoCloseable {
         dLcB = alloc(8L * SP);
         dRcB = alloc(8L * K * SP);
         dPart = alloc(8L * 4 * KMAX * Math.max(nb, nbs));
-        dScal = alloc(8L * NSCAL);
+        dRB = alloc(8L * RB_N);
+        dPlan = dRB;
+        dScal = off(dRB, 8L * RB_SCAL);
         dOpScale = alloc(8L * nodeCount);
         dThr = upload(thr);
-        dPlan = alloc(8L * 2 * (2 + 2 * NC));
-        dUnits = alloc(16L * maxUnits);
-        dNodes = alloc(8L * PMAX * 2 * NQMAX);
-        dUfirst = alloc(4L * PMAX * 2);
-        dUcount = alloc(4L * PMAX * 2);
-        dWs = alloc(8L * PMAX * NQMAX);
-        dNq = alloc(4L * PMAX);
+        if (UP_UNITS % 16 != 0) throw new AssertionError("upload layout");
+        dUp = alloc(UP_UNITS + 16L * maxUnits);
+        dNodes = off(dUp, UP_NODES);
+        dWs = off(dUp, UP_WS);
+        dUfirst = off(dUp, UP_UFIRST);
+        dUcount = off(dUp, UP_UCOUNT);
+        dNq = off(dUp, UP_NQ);
+        dUnits = off(dUp, UP_UNITS);
+        up = java.nio.ByteBuffer.allocateDirect(UP_UNITS + 16 * maxUnits).order(java.nio.ByteOrder.nativeOrder());
         dPartial = alloc(8L * maxUnits * NQMAX * KMAX);
         dAlpha = alloc(8L * PMAX * 2 * NQMAX * KMAX);
-        dX = alloc(8L * K * K);
+        dXall = alloc(8L * K * K * nodeCount);
 
         // residue-invariant region tables: rho_a = h2 FFT(frac_a), g_grid = Re FFT(ghat) / TP2,
         // gam_b = TP2 IFFT(frac_b g_grid) / N, G_b = Re gam_b(0)          (labelled_counts.__init__)
@@ -417,6 +429,7 @@ public final class TorusLandingCountEngine implements AutoCloseable {
         final int[] idx = new int[S];
         final double[] wts = new double[S], Ls = new double[S];
         for (int j = 0; j < S; j++) { idx[j] = selIdx[order[j]]; wts[j] = selW[order[j]]; Ls[j] = Lam[idx[j]]; }
+        res.secModel = (System.nanoTime() - t0) * 1e-9;
         cuMemcpyHtoD(dLam, Pointer.to(Lam), 8L * N);
         cuMemcpyHtoD(dIdx, Pointer.to(idx), 4L * S);
         cuMemcpyHtoD(dWts, Pointer.to(wts), 8L * S);
@@ -489,11 +502,16 @@ public final class TorusLandingCountEngine implements AutoCloseable {
         double k0 = 0.0;
         final double[] planA = new double[2 + 2 * NC], planB = new double[2 + 2 * NC], sc = new double[NSCAL],
                 wh0 = new double[2];
-        final double[][] I = new double[K][K];
+        final double[][][] I = new double[nodeCount][K][K];
+        final double[] LbOf = new double[nodeCount];
+        final boolean[] badX = new boolean[nodeCount];
+        cuMemsetD32(dXall, 0, 2 * K * K * nodeCount);
+        final double[] rb = new double[RB_N];
         for (int u : pre) {
             if (isTip[u]) continue;
             final int[] ch = children[u];
             for (final int v : ch) {
+                long tb = System.nanoTime();
                 final double t = branch[v];
                 // W = Out[u] x Lt of the siblings, rescaled by its max
                 int ns = 0;
@@ -535,10 +553,14 @@ public final class TorusLandingCountEngine implements AutoCloseable {
                     fft(dXo, JCufft.CUFFT_FORWARD);
                     k("k_c2r_div", nb, outBuf(outOf[v]), dXo, TP2, Nl);
                 }
-                cuMemcpyDtoH(Pointer.to(planA), dPlan, 8L * planA.length);
-                cuMemcpyDtoH(Pointer.to(planB), off(dPlan, 8L * planA.length), 8L * planB.length);
-                cuMemcpyDtoH(Pointer.to(sc), dScal, 8L * NSCAL);
-                cuMemcpyDtoH(Pointer.to(wh0), dXw, 16L);
+                long tc = System.nanoTime(); res.secLaunch += (tc - tb) * 1e-9; tb = tc;
+                k("k_copy_c", 1, off(dRB, 8L * RB_WH0), dXw, 1L);
+                cuMemcpyDtoH(Pointer.to(rb), dRB, 8L * RB_N);            // the branch's only wait for the device
+                System.arraycopy(rb, 0, planA, 0, PL);
+                System.arraycopy(rb, PL, planB, 0, PL);
+                System.arraycopy(rb, RB_SCAL, sc, 0, NSCAL);
+                wh0[0] = rb[RB_WH0]; wh0[1] = rb[RB_WH0 + 1];
+                tc = System.nanoTime(); res.secSync += (tc - tb) * 1e-9; tb = tc;
                 double lw = lo[u];
                 for (int s : ch) if (s != v) lw += ls[s];
                 lw += Math.log(sc[SC_SC]);
@@ -553,15 +575,27 @@ public final class TorusLandingCountEngine implements AutoCloseable {
                     for (int b = 0; b < K; b++) {
                         final double Ainf = W1 * Pi[a], Binf = G[b] * zb;
                         final double FA = sc[SC_SUMS + 2 * K + a], FB = sc[SC_SUMS + 3 * K + b];
-                        I[a][b] = (Ainf * Binf) * t + Ainf * FB + FA * Binf;
+                        I[v][a][b] = (Ainf * Binf) * t + Ainf * FB + FA * Binf;
                     }
                 }
-                final double[][] X = cross(v, t, planA, planB, c1, refine, res);
-                for (int a = 0; a < K; a++) {
-                    for (int b = 0; b < K; b++) res.N[v][a][b] = (lambda * (I[a][b] + X[a][b])) / Lb;
-                }
+                LbOf[v] = Lb;
+                badX[v] = !cross(v, t, planA, planB, c1, refine, res);
+                tc = System.nanoTime(); res.secCross += (tc - tb) * 1e-9; tb = tc;
             }
             free.push(outOf[u]);
+        }
+        final double[] xall = new double[K * K * nodeCount];
+        long tw = System.nanoTime();
+        cuMemcpyDtoH(Pointer.to(xall), dXall, 8L * xall.length);           // every branch's double sum X
+        res.secWait += (System.nanoTime() - tw) * 1e-9;
+        for (int v = 0; v < nodeCount; v++) {
+            if (v == root) continue;
+            for (int a = 0; a < K; a++) {
+                for (int b = 0; b < K; b++) {
+                    final double X = badX[v] ? Double.NaN : xall[(v * K + a) * K + b];
+                    res.N[v][a][b] = (lambda * (I[v][a][b] + X)) / LbOf[v];   // labelled_counts: lam (I + X) / Lb
+                }
+            }
         }
         res.k0 = k0;
         if (!Double.isFinite(logL)) res.status |= STATUS_NONFINITE;
@@ -580,17 +614,16 @@ public final class TorusLandingCountEngine implements AutoCloseable {
     }
 
     /** labelled_counts._cross for branch v: the host plan (labelled_counts_gpu._plan) and the device panel sums. */
-    private double[][] cross(int v, double t, double[] pA, double[] pB, double c1, int refine, Result res) {
-        final double[][] X = new double[K][K];
+    /** labelled_counts._cross for branch v, into dXall[v] (zero if no panel); false if v needs more than JMAX breakpoints */
+    private boolean cross(int v, double t, double[] pA, double[] pB, double c1, int refine, Result res) {
         final int nA = (int) pA[0], nB = (int) pB[0];
-        if (nA == 0 || nB == 0 || !(t > 0.0)) return X;
+        if (nA == 0 || nB == 0 || !(t > 0.0)) return true;
         final double LAmax = pA[1], LBmax = pB[1];
         final int JA = LAmax * t > c1 ? ceilLog2(LAmax * t / c1) : 0;
         final int JB = LBmax * t > c1 ? ceilLog2(LBmax * t / c1) : 0;
         if (JA > JMAX || JB > JMAX) {
             res.status |= STATUS_JMAX;
-            for (double[] row : X) Arrays.fill(row, Double.NaN);
-            return X;
+            return false;
         }
         final TreeSet<Double> bpSet = new TreeSet<Double>();
         bpSet.add(0.0);
@@ -626,7 +659,8 @@ public final class TorusLandingCountEngine implements AutoCloseable {
         }
         res.nPanels += bp.length - 1;
         res.nTerms += nterm;
-        if (np == 0) return X;
+        if (np == 0) return true;
+        long tq = System.nanoTime();
         // work units grouped by Gauss-Legendre order (one kernel launch per order), (p, side) contiguous
         final List<int[]> units = new ArrayList<int[]>();
         final int[] ufirst = new int[PMAX * 2], ucount = new int[PMAX * 2];
@@ -645,14 +679,17 @@ public final class TorusLandingCountEngine implements AutoCloseable {
             classCount[g] = units.size() - classStart[g];
         }
         if (units.size() > maxUnits) throw new IllegalStateException("cross-term work units exceed the buffer");
-        final int[] u4 = new int[4 * units.size()];
-        for (int i = 0; i < units.size(); i++) System.arraycopy(units.get(i), 0, u4, 4 * i, 4);
-        cuMemcpyHtoD(dUnits, Pointer.to(u4), 4L * u4.length);
-        cuMemcpyHtoD(dNodes, Pointer.to(nodes), 8L * nodes.length);
-        cuMemcpyHtoD(dUfirst, Pointer.to(ufirst), 4L * ufirst.length);
-        cuMemcpyHtoD(dUcount, Pointer.to(ucount), 4L * ucount.length);
-        cuMemcpyHtoD(dWs, Pointer.to(ws), 8L * ws.length);
-        cuMemcpyHtoD(dNq, Pointer.to(nq), 4L * nq.length);
+        res.secPlan += (System.nanoTime() - tq) * 1e-9; tq = System.nanoTime();
+        up.clear();
+        for (double x : nodes) up.putDouble(x);
+        for (double x : ws) up.putDouble(x);
+        for (int x : ufirst) up.putInt(x);
+        for (int x : ucount) up.putInt(x);
+        for (int x : nq) up.putInt(x);
+        if (up.position() != UP_UNITS) throw new AssertionError("upload layout");
+        for (int[] uu : units) for (int x : uu) up.putInt(x);
+        cuMemcpyHtoD(dUp, Pointer.to(up), (long) up.position());          // one upload per branch
+        res.secUpload += (System.nanoTime() - tq) * 1e-9; tq = System.nanoTime();
         for (int g = 0; g < GL_ORDERS.length; g++) {
             if (classCount[g] == 0) continue;
             launch(fn("k_cross_" + GL_ORDERS[g]), classCount[g], BLOCK, Pointer.to(dUnits), Pointer.to(new int[]{classStart[g]}),
@@ -661,11 +698,9 @@ public final class TorusLandingCountEngine implements AutoCloseable {
         }
         launch(fn("k_cross_finish"), 1, 1024, Pointer.to(dPartial), Pointer.to(dUfirst), Pointer.to(dUcount),
                 Pointer.to(dWs), Pointer.to(dNq), Pointer.to(new int[]{np}), Pointer.to(new int[]{K}), Pointer.to(dAlpha),
-                Pointer.to(dX));
-        final double[] x = new double[K * K];
-        cuMemcpyDtoH(Pointer.to(x), dX, 8L * K * K);
-        for (int a = 0; a < K; a++) for (int b = 0; b < K; b++) X[a][b] = x[a * K + b];
-        return X;
+                Pointer.to(off(dXall, 8L * K * K * v)));
+        res.secKernel += (System.nanoTime() - tq) * 1e-9;
+        return true;
     }
 
     /** labelled_counts._prop: Lt = Re(ifft2(a c with the reset mass added to mode 0)) / h2. */
