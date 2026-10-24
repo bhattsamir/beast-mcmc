@@ -93,7 +93,8 @@ public final class TorusLandingCountCaseRunner {
             children[v] = new int[ch.get(v).size()];
             for (int i = 0; i < children[v].length; i++) children[v][i] = ch.get(v).get(i);
         }
-        final int K = TorusLandingCountEngine.K;
+        final File fracPath = new File(caseFile.getParentFile(), fracFile);
+        final int K = (int) (fracPath.length() / (8L * n * n));        // regions: 3 coarse states or 6 basins
         final double[] w = new double[comps.size()];
         final double[][] mu = new double[comps.size()][];
         final double[][][] s = new double[comps.size()][][];
@@ -103,14 +104,16 @@ public final class TorusLandingCountCaseRunner {
             mu[k] = new double[]{c[1], c[2]};
             s[k] = new double[][]{{c[3], c[4]}, {c[5], c[6]}};
         }
-        final double[][] frac = readFrac(new File(caseFile.getParentFile(), fracFile), K, n);
+        final double[][] frac = readFrac(fracPath, K, n);
 
         final File run = new File(outDir, name);
         if (!run.mkdirs() && !run.isDirectory()) throw new IOException("cannot create " + run);
         final String[] clade = cladeKeys(children, root, nn);
         try (PrintWriter meta = new PrintWriter(new File(run, "meta.json"), "UTF-8")) {
             final StringBuilder b = new StringBuilder();
-            b.append("{\"format\": \"torus-counts-v1\", \"K\": 3, \"regions\": [\"helical\", \"extended\", \"alpha_L\"], ");
+            b.append("{\"format\": \"torus-counts-v1\", \"K\": ").append(K).append(", \"regions\": [");
+            for (int a = 0; a < K; a++) b.append(a == 0 ? "" : ", ").append(K == 3 ? new String[]{"\"helical\"", "\"extended\"", "\"alpha_L\""}[a] : "\"r" + a + "\"");
+            b.append("], ");
             b.append("\"nodes\": ").append(nn).append(", \"root\": ").append(root).append(", \"parent\": [");
             for (int v = 0; v < nn; v++) b.append(v == 0 ? "" : ", ").append(parent[v]);
             b.append("], \"branch\": [");

@@ -60,14 +60,14 @@ import static jcuda.driver.JCudaDriver.*;
  */
 public final class TorusLandingCountEngine implements AutoCloseable {
 
-    public static final int K = 3;                       // coarse regions: helical, extended, alpha_L
+    public static final int MAX_REGIONS = 6;             // 3 coarse states or the 6 landing basins (kernels exist for 3 and 6)
     public static final double C0 = 40.0, C1 = 1.0;      // labelled_counts.C0, C1
 
     public static final int STATUS_OK = 0;
     public static final int STATUS_NONFINITE = 1;        // a non-finite value reached the count (logL, Lb or N)
     public static final int STATUS_JMAX = 512;           // a branch needs more breakpoints than JMAX
 
-    private static final int BLOCK = 256, TILE = 1024, NQMAX = 32, KMAX = 3;
+    private static final int BLOCK = 256, TILE = 1024, NQMAX = 32, KMAX = MAX_REGIONS;
     private static final int JMAX = 48, NC = 2 * JMAX - 1, PMAX = 2 * JMAX;
     private static final int CHUNK = 4096;               // kept modes per cross-term work unit
     private static final double TWO_PI = 2.0 * Math.PI;
@@ -127,7 +127,8 @@ public final class TorusLandingCountEngine implements AutoCloseable {
     private final int[] post, pre;
     private final int[] selIdx;                          // representatives + Nyquist, ascending flat index
     private final double[] selW;
-    private final double[] G = new double[K];            // g(R_b)
+    private final int K;                                 // regions: the partition the counts are labelled by
+    private final double[] G;                            // g(R_b)
     private final int[] cslot;                           // node -> slot in the coefficient store, or -1
     private final int nOut;                              // outside densities alive at once (pool size)
     private final double[][] candVal;                    // [node][NC]: t/2^k (k = 1..JMAX), t - t/2^k (k = 2..JMAX)
@@ -178,7 +179,9 @@ public final class TorusLandingCountEngine implements AutoCloseable {
                                    double[] w, double[][] mu, double[][][] s, double[][] sigmaEps, double[][] frac,
                                    double c0, int deviceId) {
         if (n < 8 || (n & (n - 1)) != 0) throw new IllegalArgumentException("grid must be a power of two >= 8");
-        if (frac.length != K) throw new IllegalArgumentException("need " + K + " region share arrays");
+        if (frac.length != 3 && frac.length != 6) throw new IllegalArgumentException("need 3 or 6 region share arrays, got " + frac.length);
+        this.K = frac.length;
+        this.G = new double[K];
         this.n = n;
         this.N = n * n;
         this.h2 = (TWO_PI / n) * (TWO_PI / n);           // numpy: h = TWO_PI / n; h * h
@@ -401,6 +404,7 @@ public final class TorusLandingCountEngine implements AutoCloseable {
     public int getGridSize() { return n; }
     public int getResidueCount() { return nResidues; }
     public double[] getRegionMass() { return G.clone(); }
+    public int getRegionCount() { return K; }
 
     /**
      * Counts for one residue at (Sigma, lambda): labelled_counts.LabelledCounts.counts(Sigma, lam, c0, c1, refine).
@@ -692,7 +696,7 @@ public final class TorusLandingCountEngine implements AutoCloseable {
         res.secUpload += (System.nanoTime() - tq) * 1e-9; tq = System.nanoTime();
         for (int g = 0; g < GL_ORDERS.length; g++) {
             if (classCount[g] == 0) continue;
-            launch(fn("k_cross_" + GL_ORDERS[g]), classCount[g], BLOCK, Pointer.to(dUnits), Pointer.to(new int[]{classStart[g]}),
+            launch(fn("k_cross_" + GL_ORDERS[g] + "_" + K), classCount[g], BLOCK, Pointer.to(dUnits), Pointer.to(new int[]{classStart[g]}),
                     Pointer.to(dNodes), Pointer.to(dLcA), Pointer.to(dRcA), Pointer.to(dLcB), Pointer.to(dRcB),
                     Pointer.to(new long[]{SP}), Pointer.to(new int[]{K}), Pointer.to(dPartial));
         }

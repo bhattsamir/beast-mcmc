@@ -15,7 +15,7 @@
 // @author Samir Bhatt
 
 #define BLOCK 256
-#define KMAX 3          // coarse regions (helical, extended, alpha_L)
+#define KMAX 6          // regions at most: 3 coarse states (helical, extended, alpha_L) or the 6 landing basins
 #define NQMAX 32        // Gauss-Legendre nodes per panel at most (16 x refine 2)
 #define TILE 1024       // compaction tile (4 elements per thread)
 
@@ -389,54 +389,55 @@ __global__ void k_plan(const double* Lc, const int* total, const double* thr, in
 // one block per work unit (panel p, side, modes [start, start + count)), all units of one launch with NQ nodes:
 // partial[uoff + b][q][a] = sum_m Rc[a][m] exp(-(x_pq Lc[m])),  x = s (side A) or t - s (side B)
 // units: int4 (p, side, start, count); nodes: [p][side][NQMAX]
-template <int NQ>
+template <int NQ, int KR>
 __device__ void cross_body(const int4* units, int uoff, const double* nodes, const double* LcA, const double* RcA,
                            const double* LcB, const double* RcB, long SP, int K, double* partial) {
     __shared__ double xs[NQ];
-    __shared__ double red[BLOCK / 32][NQ * KMAX];
+    __shared__ double red[BLOCK / 32][NQ * KR];
     const int4 u = units[uoff + blockIdx.x];
     const int p = u.x, side = u.y, start = u.z, count = u.w;
     if (threadIdx.x < NQ) xs[threadIdx.x] = nodes[((long)p * 2 + side) * NQMAX + threadIdx.x];
     __syncthreads();
     const double* Lc = side == 0 ? LcA : LcB;
     const double* Rc = side == 0 ? RcA : RcB;
-    double acc[NQ * KMAX];
+    double acc[NQ * KR];
 #pragma unroll
-    for (int q = 0; q < NQ * KMAX; q++) acc[q] = 0.0;
+    for (int q = 0; q < NQ * KR; q++) acc[q] = 0.0;
     for (int m = start + threadIdx.x; m < start + count; m += BLOCK) {
         const double L = Lc[m];
-        double r[KMAX];
+        double r[KR];
 #pragma unroll
-        for (int a = 0; a < KMAX; a++) r[a] = a < K ? Rc[(long)a * SP + m] : 0.0;
+        for (int a = 0; a < KR; a++) r[a] = Rc[(long)a * SP + m];
 #pragma unroll
         for (int q = 0; q < NQ; q++) {
             const double e = exp(-(xs[q] * L));
 #pragma unroll
-            for (int a = 0; a < KMAX; a++) acc[q * KMAX + a] += e * r[a];
+            for (int a = 0; a < KR; a++) acc[q * KR + a] += e * r[a];
         }
     }
     // deterministic reduction: warp shuffles (fixed tree), then the warps in order
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
 #pragma unroll
-    for (int q = 0; q < NQ * KMAX; q++) {
+    for (int q = 0; q < NQ * KR; q++) {
         double v = acc[q];
         for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
         if (lane == 0) red[warp][q] = v;
     }
     __syncthreads();
-    for (int q = threadIdx.x; q < NQ * KMAX; q += BLOCK) {
+    for (int q = threadIdx.x; q < NQ * KR; q += BLOCK) {
         double s = 0.0;
         for (int w = 0; w < BLOCK / 32; w++) s += red[w][q];
-        partial[(long)(uoff + blockIdx.x) * NQMAX * KMAX + q] = s;
+        partial[(long)(uoff + blockIdx.x) * NQMAX * KMAX + (q / KR) * KMAX + q % KR] = s;
     }
 }
 
 extern "C" {
 
-#define CROSS(NQ) __global__ void k_cross_##NQ(const int4* units, int uoff, const double* nodes, const double* LcA, \
-        const double* RcA, const double* LcB, const double* RcB, long SP, int K, double* partial) { \
-    cross_body<NQ>(units, uoff, nodes, LcA, RcA, LcB, RcB, SP, K, partial); }
-CROSS(6) CROSS(8) CROSS(12) CROSS(16) CROSS(24) CROSS(32)
+#define CROSS(NQ, KR) __global__ void k_cross_##NQ##_##KR(const int4* units, int uoff, const double* nodes, \
+        const double* LcA, const double* RcA, const double* LcB, const double* RcB, long SP, int K, double* partial) { \
+    cross_body<NQ, KR>(units, uoff, nodes, LcA, RcA, LcB, RcB, SP, K, partial); }
+CROSS(6, 3) CROSS(8, 3) CROSS(12, 3) CROSS(16, 3) CROSS(24, 3) CROSS(32, 3)
+CROSS(6, 6) CROSS(8, 6) CROSS(12, 6) CROSS(16, 6) CROSS(24, 6) CROSS(32, 6)
 
 // one block: al/be per (panel, side, node, region) from the unit partials (units of a (p, side) are contiguous,
 // first unit ufirst[p * 2 + side], ucount units), then X[a][b] = sum_p sum_q (ws_pq al_pqa) be_pqb (panel order)

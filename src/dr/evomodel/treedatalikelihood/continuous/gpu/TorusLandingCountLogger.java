@@ -69,9 +69,10 @@ public final class TorusLandingCountLogger implements Logger {
     public static final int STATUS_FAILED = 1 << 4;         // the count threw; see the log
     public static final int STATUS_LOGL = 1 << 5;           // |count log L - chain's cached residue log L| > logLTol
     public static final int STATUS_CACHE = 1 << 13;         // the chain's cached value was not current (not compared)
-    private static final int K = TorusLandingCountEngine.K;
     private static final double NEG_TOL = 1e-9;
 
+    private final int K;                                // regions (3 coarse states or 6 basins), from the region file
+    private final String[] regionNames;
     private final TorusLandingGpuLikelihood likelihood;
     private final Tree tree;
     private final String[] residueIds;
@@ -95,7 +96,7 @@ public final class TorusLandingCountLogger implements Logger {
 
     public TorusLandingCountLogger(TorusLandingGpuLikelihood likelihood, Tree tree, String[] residueIds, int nGrid,
                                    double[][][] tipData, double[] w, double[][] mu, double[][][] s, double[][] sigmaEps,
-                                   double[][] frac, int[] devices, long logEvery, long startState, File outDir,
+                                   double[][] frac, String[] regionNames, int[] devices, long logEvery, long startState, File outDir,
                                    boolean async, double logLTol, double conservedSd, double conservedMax,
                                    String settings) {
         this.likelihood = likelihood;
@@ -108,6 +109,9 @@ public final class TorusLandingCountLogger implements Logger {
         this.async = async;
         this.logLTol = logLTol;
         this.settings = settings;
+        this.K = frac.length;
+        if (regionNames.length != K) throw new IllegalArgumentException(K + " regions but " + regionNames.length + " region names");
+        this.regionNames = regionNames.clone();
         this.nodeCount = tree.getNodeCount();
         if (likelihood.getResidueCount() != nResidues) throw new IllegalArgumentException("residue count differs from the likelihood");
         if (logEvery < 1) throw new IllegalArgumentException("logEvery must be >= 1");
@@ -355,8 +359,9 @@ public final class TorusLandingCountLogger implements Logger {
     // ---- meta.json
 
     private void writeMeta(boolean stopped) throws IOException {
-        final StringBuilder b = new StringBuilder("{\"format\": \"torus-counts-inmcmc-v1\", \"K\": 3, ");
-        b.append("\"regions\": [\"helical\", \"extended\", \"alpha_L\"], \"nodes\": ").append(nodeCount);
+        final StringBuilder b = new StringBuilder("{\"format\": \"torus-counts-inmcmc-v1\", \"K\": ").append(K).append(", \"regions\": [");
+        for (int a = 0; a < K; a++) b.append(a == 0 ? "" : ", ").append(json(regionNames[a]));
+        b.append("], \"nodes\": ").append(nodeCount);
         b.append(", \"root\": ").append(tree.getRoot().getNumber()).append(", \"parent\": [");
         for (int v = 0; v < nodeCount; v++) {
             final NodeRef n = tree.getNode(v);

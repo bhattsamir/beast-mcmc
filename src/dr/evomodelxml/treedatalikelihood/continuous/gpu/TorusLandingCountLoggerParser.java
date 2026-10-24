@@ -45,7 +45,7 @@ public class TorusLandingCountLoggerParser extends AbstractXMLObjectParser {
     public static final String NAME = "torusLandingCountLogger";
     private static final String LOG_EVERY = "logEvery", START = "startState", OUT_DIR = "outDir", REGIONS = "regions",
             REGIONS_MD5 = "regionsMd5", DEVICES = "devices", ASYNC = "async", LOGL_TOL = "logLTol",
-            CONSERVED_SD = "conservedSd", CONSERVED_MAX = "conservedMax";
+            CONSERVED_SD = "conservedSd", CONSERVED_MAX = "conservedMax", REGION_NAMES = "regionNames";
 
     public String getParserName() { return NAME; }
 
@@ -123,7 +123,15 @@ public class TorusLandingCountLoggerParser extends AbstractXMLObjectParser {
 
         // ---- regions
         final File regions = resolve(xo.getStringAttribute(REGIONS));
-        final double[][] frac = readFrac(regions, 3, nGrid);
+        final long cell = 8L * nGrid * nGrid;
+        if (regions.length() % cell != 0) throw new XMLParseException(regions + ": size is not a whole number of (" + nGrid + ", " + nGrid + ") float64 grids");
+        final int nReg = (int) (regions.length() / cell);
+        final double[][] frac = readFrac(regions, nReg, nGrid);
+        final String[] regionNames;
+        if (xo.hasAttribute(REGION_NAMES)) regionNames = xo.getStringAttribute(REGION_NAMES).trim().split("\\s*,\\s*");
+        else if (nReg == 3) regionNames = new String[]{"helical", "extended", "alpha_L"};
+        else throw new XMLParseException(regions + " has " + nReg + " regions: name them with " + REGION_NAMES + "=\"...\"");
+        if (regionNames.length != nReg) throw new XMLParseException(REGION_NAMES + " lists " + regionNames.length + " names for " + nReg + " regions");
         final String md5 = md5(regions);
         if (xo.hasAttribute(REGIONS_MD5) && !xo.getStringAttribute(REGIONS_MD5).equalsIgnoreCase(md5)) {
             throw new XMLParseException(regions + ": md5 " + md5 + " differs from regionsMd5 " + xo.getStringAttribute(REGIONS_MD5));
@@ -148,10 +156,10 @@ public class TorusLandingCountLoggerParser extends AbstractXMLObjectParser {
         final boolean async = xo.getAttribute(ASYNC, false);
         final double logLTol = xo.getAttribute(LOGL_TOL, 1e-6);
         final double cSd = xo.getAttribute(CONSERVED_SD, 3.0), cMax = xo.getAttribute(CONSERVED_MAX, 8.0);
-        final String settings = "nGrid=" + nGrid + " regions=" + regions.getName() + " md5=" + md5 + " devices="
+        final String settings = "nGrid=" + nGrid + " regions=" + regions.getName() + " K=" + nReg + " md5=" + md5 + " devices="
                 + java.util.Arrays.toString(devices) + " conservedSd=" + cSd + " conservedMax=" + cMax;
         try {
-            return new TorusLandingCountLogger(lik, tree, ids, nGrid, tipData, w, mu, s, sigmaEps, frac, devices, logEvery,
+            return new TorusLandingCountLogger(lik, tree, ids, nGrid, tipData, w, mu, s, sigmaEps, frac, regionNames, devices, logEvery,
                     start, outDir, async, logLTol, cSd, cMax, settings);
         } catch (IllegalArgumentException e) {
             throw new XMLParseException(NAME + ": " + e.getMessage());
@@ -233,6 +241,7 @@ public class TorusLandingCountLoggerParser extends AbstractXMLObjectParser {
                 AttributeRule.newDoubleRule(LOGL_TOL, true),
                 AttributeRule.newDoubleRule(CONSERVED_SD, true),
                 AttributeRule.newDoubleRule(CONSERVED_MAX, true),
+                AttributeRule.newStringRule(REGION_NAMES, true),
                 new ElementRule(TorusLandingGpuLikelihood.class),
         };
     }
