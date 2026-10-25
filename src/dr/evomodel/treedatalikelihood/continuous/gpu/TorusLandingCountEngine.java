@@ -410,9 +410,20 @@ public final class TorusLandingCountEngine implements AutoCloseable {
      * Counts for one residue at (Sigma, lambda): labelled_counts.LabelledCounts.counts(Sigma, lam, c0, c1, refine).
      */
     public Result count(int residue, double[][] sigma, double lambda, double c1, int refine) {
+        return count(residue, sigma, lambda, 0.0, 0.0, c1, refine);
+    }
+
+    /**
+     * Combined model (landing AND additive jumps): landing counts at (Sigma, lambda, lambdaA, sJ), as
+     * labelled_counts_both.LabelledCountsBoth: only the decay rate gains lambdaA (1 - exp(-1/2 sJ^2 |m|^2)); landings
+     * are still counted at rate lambda (additive jumps are not counted). lambdaA == 0 is the landing count, unchanged.
+     */
+    public Result count(int residue, double[][] sigma, double lambda, double lambdaA, double sJ, double c1, int refine) {
         if (closed) throw new IllegalStateException("count engine closed");
         if (refine != 1 && refine != 2) throw new IllegalArgumentException("refine must be 1 or 2");
         if (!(lambda > 0.0) || !Double.isFinite(lambda)) throw new IllegalArgumentException("lambda must be finite and > 0");
+        if (!(lambdaA >= 0.0) || !Double.isFinite(lambdaA)) throw new IllegalArgumentException("lambdaA must be finite and >= 0");
+        if (lambdaA > 0.0 && !(sJ > 0.0 && Double.isFinite(sJ))) throw new IllegalArgumentException("sJ must be finite and > 0");
         for (double[] row : sigma) for (double x : row) if (!Double.isFinite(x)) throw new IllegalArgumentException("Sigma must be finite");
         if (residue < 0 || residue >= nResidues) throw new IllegalArgumentException("residue out of range");
         final long t0 = System.nanoTime();
@@ -425,6 +436,10 @@ public final class TorusLandingCountEngine implements AutoCloseable {
         final double[] Lam = new double[N];
         for (int i = 0; i < N; i++) {
             Lam[i] = quad(sigma, mode(i / n), mode(i % n)) + lambda;
+            if (lambdaA > 0.0) {                         // labelled_counts_both._model, same order of operations
+                final double m1 = mode(i / n), m2 = mode(i % n);
+                Lam[i] += lambdaA * (-Math.expm1(-0.5 * (sJ * sJ) * (m1 * m1 + m2 * m2)));
+            }
             if (!(Lam[i] > 0.0)) throw new IllegalArgumentException("Sigma is not positive semi-definite: some rates Lambda <= 0");
         }
         final double[] key = new double[S];

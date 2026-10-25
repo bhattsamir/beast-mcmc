@@ -47,12 +47,18 @@ import java.util.logging.Logger;
  * operator; from then on the kernel is fixed, so draws after that point are a valid MCMC sample. Discard at
  * least the adaptation period as burn-in.
  *
+ * <p><b>Combined model.</b> If the likelihood has additive jumps ({@link TorusLandingGpuLikelihood#isCombined}),
+ * each residue's block is six-dimensional: x_r also holds its additive jump rate lambda_A,r and jump size s_J,r
+ * (one value per residue each), proposed as u = (..., log lambda_A, log s_J) with the matching Jacobian terms. A
+ * finite upper bound on s_J is honoured by rejecting proposals above it. Without additive jumps the block is the
+ * four-dimensional one above, unchanged.
+ *
  * @author Samir Bhatt
  */
 public class TorusResidueBlockOperator extends SimpleMCMCOperator implements GibbsOperator {
 
     public static final String OPERATOR_NAME = "torusResidueBlockOperator";
-    private static final int D = 4;
+    private final int D;                         // 4, or 6 with additive jumps
     private static final double TARGET = 0.234;
     private static final double EPS = 1e-8;
 
@@ -64,6 +70,9 @@ public class TorusResidueBlockOperator extends SimpleMCMCOperator implements Gib
     private final Parameter[] diag;
     private final Parameter[] off;
     private final Parameter lambda;
+    private final Parameter lamA;                // combined model only (else null)
+    private final Parameter sJ;
+    private final double sJMax;                  // s_J upper bound (infinite if none)
     private final double bound;
     private final long adaptStart;
     private final long adaptUntil;
@@ -104,6 +113,27 @@ public class TorusResidueBlockOperator extends SimpleMCMCOperator implements Gib
             throw new IllegalArgumentException(OPERATOR_NAME + " needs one jump rate per residue (dimension " + R
                     + "), got dimension " + lambda.getDimension());
         }
+        this.lamA = likelihood.isCombined() ? likelihood.getAdditiveRate() : null;
+        this.sJ = likelihood.isCombined() ? likelihood.getAdditiveSize() : null;
+        this.D = lamA == null ? 4 : 6;
+        double smax = Double.POSITIVE_INFINITY;
+        if (lamA != null) {
+            if (lamA.getDimension() != R || sJ.getDimension() != R) {
+                throw new IllegalArgumentException(OPERATOR_NAME + " needs one additive rate and one jump size per residue"
+                        + " (dimension " + R + ")");
+            }
+            final Bounds<Double> sb = sJ.getBounds();
+            if (sb != null) {
+                smax = sb.getUpperLimit(0);
+                for (int r = 0; r < R; r++) {
+                    if (sb.getLowerLimit(r) > 0.0 || sb.getUpperLimit(r) != smax) {
+                        throw new IllegalArgumentException(OPERATOR_NAME + ": jump size bounds must be [0, U] with one U"
+                                + " for every residue");
+                    }
+                }
+            }
+        }
+        this.sJMax = smax;
         this.diag = new Parameter[R];
         this.off = new Parameter[R];
         double b = Double.NaN;
@@ -130,6 +160,7 @@ public class TorusResidueBlockOperator extends SimpleMCMCOperator implements Gib
             if (r == 0) b = hi;
             else if (hi != b) throw new IllegalArgumentException(OPERATOR_NAME + ": correlation bounds differ across residues");
             requireBounds(lambda, r, 0.0, Double.POSITIVE_INFINITY, "jump rate");
+            if (lamA != null) requireBounds(lamA, r, 0.0, Double.POSITIVE_INFINITY, "additive jump rate");
         }
         this.bound = b;
 
@@ -186,6 +217,9 @@ public class TorusResidueBlockOperator extends SimpleMCMCOperator implements Gib
             fromU(u2[r], x2[r]);
             valid[r] = x2[r][0] > 0.0 && x2[r][1] > 0.0 && Double.isFinite(x2[r][0]) && Double.isFinite(x2[r][1])
                     && Math.abs(x2[r][2]) <= bound && x2[r][3] > 0.0 && Double.isFinite(x2[r][3]);
+            if (D == 6) {
+                valid[r] &= x2[r][4] > 0.0 && Double.isFinite(x2[r][4]) && x2[r][5] > 0.0 && x2[r][5] <= sJMax;
+            }
             if (valid[r]) nValid++;
             else numericalRejects++;
         }
@@ -257,7 +291,7 @@ public class TorusResidueBlockOperator extends SimpleMCMCOperator implements Gib
         return s;
     }
 
-    /** The leaf components of 'prior' whose value changes when residue r's four parameters all change. */
+    /** The leaf components of 'prior' whose value changes when all of residue r's parameters change. */
     private void discoverPriorDependencies() {
         final List<Likelihood> leaves = new ArrayList<Likelihood>();
         flatten(prior, leaves);
@@ -271,6 +305,10 @@ public class TorusResidueBlockOperator extends SimpleMCMCOperator implements Gib
             y[1] = 0.6 * x[1];
             y[2] = Math.abs(x[2]) < 0.5 * bound ? x[2] + 0.4 * bound : x[2] - Math.signum(x[2]) * 0.4 * bound;
             y[3] = 1.7 * x[3];
+            if (D == 6) {
+                y[4] = 1.7 * x[4];
+                y[5] = 0.6 * x[5];
+            }
             final double[] before = new double[leaves.size()];
             for (int c = 0; c < before.length; c++) before[c] = leaves.get(c).getLogLikelihood();
             write(r, y);
@@ -325,7 +363,7 @@ public class TorusResidueBlockOperator extends SimpleMCMCOperator implements Gib
                 final double[] c = new double[D * D];
                 for (int i = 0; i < D * D; i++) c[i] = m2[r][i] / Math.max(1.0, t - 1.0) * (2.38 * 2.38 / D);
                 for (int i = 0; i < D; i++) c[i * D + i] += EPS;
-                if (cholesky(c)) {
+                if (cholesky(c, D)) {
                     System.arraycopy(c, 0, chol[r], 0, D * D);
                 }
             }
@@ -333,7 +371,7 @@ public class TorusResidueBlockOperator extends SimpleMCMCOperator implements Gib
     }
 
     /** In-place lower Cholesky of a D x D matrix; false (input undefined) if not positive definite. */
-    private static boolean cholesky(double[] a) {
+    private static boolean cholesky(double[] a, int D) {
         for (int j = 0; j < D; j++) {
             double s = a[j * D + j];
             for (int k = 0; k < j; k++) s -= a[j * D + k] * a[j * D + k];
@@ -357,6 +395,10 @@ public class TorusResidueBlockOperator extends SimpleMCMCOperator implements Gib
         x[1] = diag[r].getParameterValue(1);
         x[2] = off[r].getParameterValue(0);
         x[3] = lambda.getParameterValue(r);
+        if (D == 6) {
+            x[4] = lamA.getParameterValue(r);
+            x[5] = sJ.getParameterValue(r);
+        }
     }
 
     private void write(int r, double[] x) {
@@ -364,6 +406,10 @@ public class TorusResidueBlockOperator extends SimpleMCMCOperator implements Gib
         diag[r].setParameterValue(1, x[1]);
         off[r].setParameterValue(0, x[2]);
         lambda.setParameterValue(r, x[3]);
+        if (D == 6) {
+            lamA.setParameterValue(r, x[4]);
+            sJ.setParameterValue(r, x[5]);
+        }
     }
 
     private void writeQuietly(int r, double[] x) {
@@ -371,6 +417,10 @@ public class TorusResidueBlockOperator extends SimpleMCMCOperator implements Gib
         diag[r].setParameterValueQuietly(1, x[1]);
         off[r].setParameterValueQuietly(0, x[2]);
         lambda.setParameterValueQuietly(r, x[3]);
+        if (D == 6) {
+            lamA.setParameterValueQuietly(r, x[4]);
+            sJ.setParameterValueQuietly(r, x[5]);
+        }
     }
 
     private void toU(double[] x, double[] u) {
@@ -379,6 +429,10 @@ public class TorusResidueBlockOperator extends SimpleMCMCOperator implements Gib
         final double c = x[2] / bound;
         u[2] = 0.5 * Math.log1p(2.0 * c / (1.0 - c));   // atanh(c), stable
         u[3] = Math.log(x[3]);
+        if (D == 6) {
+            u[4] = Math.log(x[4]);
+            u[5] = Math.log(x[5]);
+        }
     }
 
     private void fromU(double[] u, double[] x) {
@@ -386,13 +440,18 @@ public class TorusResidueBlockOperator extends SimpleMCMCOperator implements Gib
         x[1] = Math.exp(u[1]);
         x[2] = bound * Math.tanh(u[2]);
         x[3] = Math.exp(u[3]);
+        if (D == 6) {
+            x[4] = Math.exp(u[4]);
+            x[5] = Math.exp(u[5]);
+        }
     }
 
-    /** log |dx/du| = u0 + u1 + log(b (1 - tanh^2 u2)) + u3, with log(1 - tanh^2 v) = -2 log cosh v */
+    /** log |dx/du| = u0 + u1 + log(b (1 - tanh^2 u2)) + u3 [+ u4 + u5], with log(1 - tanh^2 v) = -2 log cosh v */
     private double logJacobian(double[] u) {
         final double a = Math.abs(u[2]);
         final double logCosh = a + Math.log1p(Math.exp(-2.0 * a)) - Math.log(2.0);
-        return u[0] + u[1] + Math.log(bound) - 2.0 * logCosh + u[3];
+        final double j = u[0] + u[1] + Math.log(bound) - 2.0 * logCosh + u[3];
+        return D == 6 ? j + u[4] + u[5] : j;
     }
 
     public void setPathParameter(double beta) {

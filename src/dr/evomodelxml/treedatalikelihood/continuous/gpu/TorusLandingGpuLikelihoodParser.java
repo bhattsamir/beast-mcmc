@@ -43,6 +43,8 @@ public class TorusLandingGpuLikelihoodParser extends AbstractXMLObjectParser {
     public static final String JUMP_LAW = "jumpLaw";
     public static final String JUMP_RATE = "jumpRate";
     public static final String JUMP_COMPONENT = "jumpComponent";
+    public static final String ADDITIVE_RATE = "additiveRate";    // combined model, with ADDITIVE_SIZE
+    public static final String ADDITIVE_SIZE = "additiveSize";    // additive jump SD (radians)
     public static final String WEIGHT = "weight";
     public static final String DISPLACEMENT = "displacement";
     public static final String SIGMA_EPSILON = "sigmaEpsilon";
@@ -109,6 +111,29 @@ public class TorusLandingGpuLikelihoodParser extends AbstractXMLObjectParser {
         if (jumpRate.getDimension() != 1 && jumpRate.getDimension() != precisions.size()) {
             throw new XMLParseException("<" + JUMP_RATE + "> must have dimension 1 (shared) or "
                     + precisions.size() + " (one lambda per residue), got " + jumpRate.getDimension());
+        }
+
+        // combined model (optional): additive jumps alongside the landings
+        final boolean hasRate = xo.hasChildNamed(ADDITIVE_RATE), hasSize = xo.hasChildNamed(ADDITIVE_SIZE);
+        if (hasRate != hasSize) {
+            throw new XMLParseException("<" + ADDITIVE_RATE + "> and <" + ADDITIVE_SIZE + "> go together");
+        }
+        final Parameter additiveRate = hasRate ? (Parameter) xo.getElementFirstChild(ADDITIVE_RATE) : null;
+        final Parameter additiveSize = hasSize ? (Parameter) xo.getElementFirstChild(ADDITIVE_SIZE) : null;
+        if (additiveRate != null) {
+            for (Parameter q : new Parameter[]{additiveRate, additiveSize}) {
+                if (q.getDimension() != 1 && q.getDimension() != precisions.size()) {
+                    throw new XMLParseException("<" + ADDITIVE_RATE + "> and <" + ADDITIVE_SIZE + "> must have dimension 1 "
+                            + "or " + precisions.size() + ", got " + q.getDimension());
+                }
+            }
+            for (int i = 0; i < additiveSize.getDimension(); i++) {
+                final double v = additiveSize.getParameterValue(i);
+                if (!(v > 0.0) || v > 2 * Math.PI) {
+                    throw new XMLParseException("<" + ADDITIVE_SIZE + "> is a standard deviation in RADIANS in (0, 2 pi], got "
+                            + v + " (degrees? " + Math.toRadians(v) + " rad)");
+                }
+            }
         }
 
         // landing mixture: production parser, jumpComponent branch, weights normalised by their sum
@@ -208,8 +233,8 @@ public class TorusLandingGpuLikelihoodParser extends AbstractXMLObjectParser {
         String id = xo.getId();
         if (id == null) id = getParserName();
         try {
-            return new TorusLandingGpuLikelihood(id, tree, precisions, tipData, jumpRate, jumpW, jumpD, jumpS,
-                    sigmaEps, sigmaEpsilon, nGrid, devices, maxBatch);
+            return new TorusLandingGpuLikelihood(id, tree, precisions, tipData, jumpRate, additiveRate, additiveSize,
+                    jumpW, jumpD, jumpS, sigmaEps, sigmaEpsilon, nGrid, devices, maxBatch);
         } catch (IllegalArgumentException e) {
             throw new XMLParseException("Invalid landing likelihood: " + e.getMessage());
         }
@@ -321,6 +346,8 @@ public class TorusLandingGpuLikelihoodParser extends AbstractXMLObjectParser {
                         new ElementRule(MatrixParameter.class)
                 }, 1, Integer.MAX_VALUE),
                 new ElementRule(JUMP_RATE, new XMLSyntaxRule[]{new ElementRule(Parameter.class)}),
+                new ElementRule(ADDITIVE_RATE, new XMLSyntaxRule[]{new ElementRule(Parameter.class)}, true),
+                new ElementRule(ADDITIVE_SIZE, new XMLSyntaxRule[]{new ElementRule(Parameter.class)}, true),
                 new ElementRule(SIGMA_EPSILON, new XMLSyntaxRule[]{new ElementRule(Parameter.class)}, true),
                 new ElementRule(JUMP_COMPONENT, new XMLSyntaxRule[]{
                         AttributeRule.newDoubleRule(WEIGHT, true),

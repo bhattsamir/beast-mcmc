@@ -42,6 +42,12 @@ import java.util.logging.Logger;
  * <p>{@link #evaluateProposals} evaluates residues at their CURRENT parameter values without making them the
  * accepted state, and remembers the results by value (used by {@link TorusResidueBlockOperator}).
  *
+ * <p><b>Combined model</b> (optional): an additive jump rate and an additive jump size (each of dimension 1 or one
+ * per residue; zero-mean isotropic wrapped-normal displacements of standard deviation s_J radians) add additive jumps
+ * to the landing jumps. Each Fourier mode's decay rate gains lambda_A (1 - exp(-1/2 s_J^2 |m|^2)); the stationary
+ * root and the landing resets follow (paper Appendix B, Prop. 1). The value key is then seven numbers. Without these
+ * two parameters the class is the landing likelihood, arithmetic unchanged.
+ *
  * <p>Production failures are kept: a non-finite branch message or a partial without a positive maximum throws
  * ArithmeticException from {@link #getLogLikelihood}, as production does, and a non-positive root integral
  * gives -infinity. The tree must not change (fixed-tree analyses only), and Sigma_eps is fixed.
@@ -52,11 +58,13 @@ public class TorusLandingGpuLikelihood extends AbstractModelLikelihood implement
 
     public static final String TORUS_LANDING_GPU_LIKELIHOOD = "torusLandingGpuLikelihood";
     private static final double MIN_BRANCH = 1.0e-8;    // production TorusFourierTreeLikelihood.MIN_BRANCH
-    private static final int KEY = 5;                   // P00, P01, P10, P11, lambda
+    private final int KEY;                              // P00, P01, P10, P11, lambda [, lambda_A, s_J]
 
     private final Tree tree;
     private final List<MatrixParameter> precisions;
     private final Parameter jumpRate;
+    private final Parameter additiveRate;               // nullable (landing model); with additiveSize
+    private final Parameter additiveSize;               // jump SD s_J, radians
     private final TorusLandingGpuEngine[] engines;
     private final int[] engineOf;                       // residue -> engine
     private final int[] localIndex;                     // residue -> index within its engine
@@ -92,15 +100,39 @@ public class TorusLandingGpuLikelihood extends AbstractModelLikelihood implement
                                      Parameter jumpRate, double[] w, double[][] mu, double[][][] s,
                                      double[][] sigmaEps, Parameter sigmaEpsilonParameter,
                                      int nGrid, int[] devices, int maxBatch) {
+        this(name, tree, precisions, tipData, jumpRate, null, null, w, mu, s, sigmaEps, sigmaEpsilonParameter, nGrid,
+                devices, maxBatch);
+    }
+
+    /** Combined model: additiveRate and additiveSize both null (landing) or both given. */
+    public TorusLandingGpuLikelihood(String name, Tree tree, List<MatrixParameter> precisions, double[][][] tipData,
+                                     Parameter jumpRate, Parameter additiveRate, Parameter additiveSize,
+                                     double[] w, double[][] mu, double[][][] s,
+                                     double[][] sigmaEps, Parameter sigmaEpsilonParameter,
+                                     int nGrid, int[] devices, int maxBatch) {
         super(name);
         this.tree = tree;
         this.precisions = precisions;
         this.jumpRate = jumpRate;
+        this.additiveRate = additiveRate;
+        this.additiveSize = additiveSize;
         this.nResidues = precisions.size();
         this.sigmaEpsilonParameter = sigmaEpsilonParameter;
         if (jumpRate == null || (jumpRate.getDimension() != 1 && jumpRate.getDimension() != nResidues)) {
             throw new IllegalArgumentException("landing requires jumpRate with dimension 1 or nResidues");
         }
+        if ((additiveRate == null) != (additiveSize == null)) {
+            throw new IllegalArgumentException("additiveRate and additiveSize go together");
+        }
+        if (additiveRate != null) {
+            for (Parameter q : new Parameter[]{additiveRate, additiveSize}) {
+                if (q.getDimension() != 1 && q.getDimension() != nResidues) {
+                    throw new IllegalArgumentException("additive parameters need dimension 1 or nResidues ("
+                            + nResidues + "), got " + q.getDimension() + " for " + q.getId());
+                }
+            }
+        }
+        this.KEY = additiveRate == null ? 5 : 7;
         for (int r = 0; r < nResidues; r++) {
             final MatrixParameter p = precisions.get(r);
             if (p.getRowDimension() != 2 || p.getColumnDimension() != 2) {
@@ -154,10 +186,13 @@ public class TorusLandingGpuLikelihood extends AbstractModelLikelihood implement
         if (tree instanceof Model) addModel((Model) tree);
         for (MatrixParameter p : precisions) addVariable(p);
         addVariable(jumpRate);
+        if (additiveRate != null) { addVariable(additiveRate); addVariable(additiveSize); }
         if (sigmaEpsilonParameter != null) addVariable(sigmaEpsilonParameter);
         final StringBuilder dev = new StringBuilder();
         for (int e = 0; e < E; e++) dev.append(e == 0 ? "" : ",").append(devices[e]);
-        Logger.getLogger("dr.evomodel").info("TorusLandingGpuLikelihood '" + name + "': " + nResidues
+        Logger.getLogger("dr.evomodel").info("TorusLandingGpuLikelihood '" + name + "': "
+                + (additiveRate == null ? "landing model, " : "COMBINED model (landing + additive jumps, rate '"
+                + additiveRate.getId() + "', size '" + additiveSize.getId() + "'), ") + nResidues
                 + " residues, nGrid=" + nGrid + ", devices " + dev + ", " + engines[0].getPartialBufferCount()
                 + " partial buffers; SIGMA_EPS APPLIED, tip observation-error covariance in rad^2 = [" + sigmaEps[0][0] + " "
                 + sigmaEps[0][1] + "; " + sigmaEps[1][0] + " " + sigmaEps[1][1] + "]  (per-axis sd in degrees: "
@@ -168,6 +203,9 @@ public class TorusLandingGpuLikelihood extends AbstractModelLikelihood implement
     public int getResidueCount() { return nResidues; }
     public MatrixParameter getPrecision(int r) { return precisions.get(r); }
     public Parameter getJumpRate() { return jumpRate; }
+    public boolean isCombined() { return additiveRate != null; }
+    public Parameter getAdditiveRate() { return additiveRate; }
+    public Parameter getAdditiveSize() { return additiveSize; }
     public TorusLandingGpuEngine[] getEngines() { return engines.clone(); }
     public long getResidueEvaluationCount() { return residueEvaluations; }
     public long getValueCacheHits() { return valueCacheHits; }
@@ -272,16 +310,19 @@ public class TorusLandingGpuLikelihood extends AbstractModelLikelihood implement
                 final int[] local = new int[m];
                 final double[][][] sigma = new double[m][][];
                 final double[] lambda = new double[m];
+                final double[] lamA = additiveRate == null ? null : new double[m];
+                final double[] sJ = additiveRate == null ? null : new double[m];
                 for (int j = 0; j < m; j++) {
                     final int r = residues[pos[ee][j]];
                     final double[] c = cur[r];
                     local[j] = localIndex[r];
                     sigma[j] = TorusLandingGpuEngine.invertPrecision(new double[][]{{c[0], c[1]}, {c[2], c[3]}});
                     lambda[j] = c[4];
+                    if (lamA != null) { lamA[j] = c[5]; sJ[j] = c[6]; }
                 }
                 final double[] ll = new double[m];
                 final int[] st = new int[m];
-                engines[ee].logLikelihood(local, sigma, lambda, ll, st);
+                engines[ee].logLikelihood(local, sigma, lambda, lamA, sJ, ll, st);
                 for (int j = 0; j < m; j++) { logL[pos[ee][j]] = ll[j]; status[pos[ee][j]] = st[j]; }
             };
             if (pool == null) job.run(); else jobs.add(pool.submit(job));
@@ -298,11 +339,17 @@ public class TorusLandingGpuLikelihood extends AbstractModelLikelihood implement
         residueEvaluations += k;
     }
 
-    /** The five numbers a residue's log-likelihood depends on, read exactly as production reads them. */
+    /** The five (combined model: seven) numbers a residue's log-likelihood depends on, read as production reads them. */
     private double[] currentKey(int r) {
         final MatrixParameter p = precisions.get(r);
+        if (additiveRate == null) {
+            return new double[]{p.getParameterValue(0, 0), p.getParameterValue(0, 1), p.getParameterValue(1, 0),
+                    p.getParameterValue(1, 1), jumpRate.getParameterValue(jumpRate.getDimension() == 1 ? 0 : r)};
+        }
         return new double[]{p.getParameterValue(0, 0), p.getParameterValue(0, 1), p.getParameterValue(1, 0),
-                p.getParameterValue(1, 1), jumpRate.getParameterValue(jumpRate.getDimension() == 1 ? 0 : r)};
+                p.getParameterValue(1, 1), jumpRate.getParameterValue(jumpRate.getDimension() == 1 ? 0 : r),
+                additiveRate.getParameterValue(additiveRate.getDimension() == 1 ? 0 : r),
+                additiveSize.getParameterValue(additiveSize.getDimension() == 1 ? 0 : r)};
     }
 
     private static void throwProductionFailure(int r, int status) {

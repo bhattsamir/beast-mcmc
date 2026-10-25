@@ -34,6 +34,14 @@ __device__ __forceinline__ double quad_form(const double* s, double m0, double m
     return q;
 }
 
+// Combined model (landing AND additive jumps): the additive part of the decay rate of mode m,
+//   lambda_A (1 - nuhat(m)),  nuhat(m) = exp(-1/2 s_J^2 |m|^2)  (zero-mean isotropic wrapped-normal jumps),
+// added to a = 1/2 m'Sigma m wherever the landing kernels use it. Callers skip it when lambda_A == 0, so the
+// landing-only arithmetic is unchanged bit for bit. sj2 = s_J^2 (radians^2).
+__device__ __forceinline__ double additive_rate(double LA, double SJ2, double m0, double m1) {
+    return LA * (-expm1(-0.5 * SJ2 * (m0 * m0 + m1 * m1)));
+}
+
 // error-free transformation a + b = s + e
 __device__ __forceinline__ void two_sum(double a, double b, double* s, double* e) {
     const double sum = a + b;
@@ -130,16 +138,19 @@ __device__ __forceinline__ void landing_mode(double x, double* damping, double* 
 // and damp c by exp(-(lambda + a) t). sig is [B][4] covariance (row-major), lam [B].
 // Writes per-block compensated partial sums to part[b][blockIdx.x][2].
 extern "C" __global__ void apply_landing(double2* X, const double2* ghat, const double* sig, const double* lam,
+                                         const double* lamA, const double* sj2,
                                          double t, int n, int N, double* part) {
     const int b = blockIdx.y;
     const double* s = sig + 4 * b;
     const double L = lam[b];
+    const double LA = lamA[b], SJ2 = sj2[b];
     double2* x = X + (size_t) b * N;
     double acc = 0.0, err = 0.0;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < N; idx += gridDim.x * blockDim.x) {
         double m0, m1;
         mode_of(idx, n, &m0, &m1);
-        const double a = 0.5 * quad_form(s, m0, m1);
+        double a = 0.5 * quad_form(s, m0, m1);
+        if (LA > 0.0) a += additive_rate(LA, SJ2, m0, m1);
         double damping, oneMinus;
         landing_mode(-(L + a) * t, &damping, &oneMinus);
         double2 c = x[idx];
@@ -186,10 +197,12 @@ extern "C" __global__ void tip_phases(double2* T, const double* theta, const int
 // magnitude exp(-i m.theta) with magnitude = (nTotal / (2 pi)^2) exp(-1/2 m'Se m)), then the landing operator
 // exactly as apply_landing. Writes the damped coefficients to X and the reset partial sums to part.
 extern "C" __global__ void tip_apply(double2* X, const double2* T, const double* tipMag, const double2* ghat,
-                                     const double* sig, const double* lam, double t, int n, int N, double* part) {
+                                     const double* sig, const double* lam, const double* lamA, const double* sj2,
+                                     double t, int n, int N, double* part) {
     const int b = blockIdx.y;
     const double* s = sig + 4 * b;
     const double L = lam[b];
+    const double LA = lamA[b], SJ2 = sj2[b];
     const double2* T0 = T + ((size_t) b * 2) * n;
     const double2* T1 = T + ((size_t) b * 2 + 1) * n;
     double2* x = X + (size_t) b * N;
@@ -204,7 +217,8 @@ extern "C" __global__ void tip_apply(double2* X, const double2* T, const double*
         double2 c;
         c.x = mag * (p0.x * p1.x - p0.y * p1.y);
         c.y = mag * (p0.x * p1.y + p0.y * p1.x);
-        const double a = 0.5 * quad_form(s, m0, m1);
+        double a = 0.5 * quad_form(s, m0, m1);
+        if (LA > 0.0) a += additive_rate(LA, SJ2, m0, m1);
         double damping, oneMinus;
         landing_mode(-(L + a) * t, &damping, &oneMinus);
         if (L > 0.0) {
@@ -326,18 +340,22 @@ extern "C" __global__ void normalize(double* P, const double* blkmax, int nblk, 
 // production rootIntegralLanding (lambda > 0): sum over modes of
 //   lambda / (lambda + 1/2 m'Sigma m) * Re(ghat * c)   from the forward FFT c of the root partial.
 // Residues with lambda == 0 contribute 0 here (their root integral is the grid mean, see sum_real).
+// Combined model: the stationary law is lambda ghat / (lambda + 1/2 m'Sigma m + lambda_A (1 - nuhat)).
 extern "C" __global__ void root_sum(const double2* X, const double2* ghat, const double* sig, const double* lam,
-                                   int n, int N, double* part) {
+                                   const double* lamA, const double* sj2, int n, int N, double* part) {
     const int b = blockIdx.y;
     const double* s = sig + 4 * b;
     const double L = lam[b];
+    const double LA = lamA[b], SJ2 = sj2[b];
     const double2* x = X + (size_t) b * N;
     double acc = 0.0, err = 0.0;
     if (L > 0.0) {
         for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < N; idx += gridDim.x * blockDim.x) {
             double m0, m1;
             mode_of(idx, n, &m0, &m1);
-            const double weight = L / (L + 0.5 * quad_form(s, m0, m1));
+            double u = 0.5 * quad_form(s, m0, m1);
+            if (LA > 0.0) u += additive_rate(LA, SJ2, m0, m1);
+            const double weight = L / (L + u);
             const double2 g = ghat[idx];
             const double2 c = x[idx];
             const double term = weight * (g.x * c.x - g.y * c.y);

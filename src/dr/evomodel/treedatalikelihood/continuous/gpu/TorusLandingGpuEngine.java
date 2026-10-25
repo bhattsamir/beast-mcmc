@@ -96,6 +96,7 @@ public final class TorusLandingGpuEngine implements AutoCloseable {
     private final CUfunction fTipPhases, fTipApply, fApply, fCorrection, fLoad, fCombine, fNormalize, fRootSum,
             fSumReal, fFinalize;
     private final CUdeviceptr dX, dT, dScale, dPart, dBlkMax, dBad, dOut, dOutMean, dGhat, dTipMag, dSig, dLam, dRmap;
+    private final CUdeviceptr dLamA, dSj2;               // combined model: additive rate and jump variance per slot
     private final CUdeviceptr dTheta, dPresent;
     private final CUdeviceptr[] dP;
     private final CUdeviceptr nullPtr = new CUdeviceptr();
@@ -252,6 +253,8 @@ public final class TorusLandingGpuEngine implements AutoCloseable {
         this.dOutMean = alloc(B * 8L);
         this.dSig = alloc(B * 4L * 8L);
         this.dLam = alloc(B * 8L);
+        this.dLamA = alloc(B * 8L);
+        this.dSj2 = alloc(B * 8L);
         this.dRmap = alloc(B * 4L);
         final double[] ghat = new double[2 * nTotal];
         for (int i = 0; i < nTotal; i++) { ghat[2 * i] = ghatRe[i]; ghat[2 * i + 1] = ghatIm[i]; }
@@ -282,10 +285,24 @@ public final class TorusLandingGpuEngine implements AutoCloseable {
      * @param status   out (nullable): [k] STATUS_* bit set
      */
     public void logLikelihood(int[] residues, double[][][] sigma, double[] lambda, double[] logL, int[] status) {
+        logLikelihood(residues, sigma, lambda, null, null, logL, status);
+    }
+
+    /**
+     * Combined model (landing AND additive jumps): as {@link #logLikelihood(int[], double[][][], double[], double[], int[])}
+     * with, per residue, an additive jump rate lambdaA[k] >= 0 and a jump size sJ[k] > 0 (radians; zero-mean isotropic
+     * wrapped-normal displacements). Each mode's decay rate gains lambdaA (1 - exp(-1/2 sJ^2 |m|^2)). lambdaA and sJ
+     * null, or lambdaA[k] == 0, is the landing model with unchanged arithmetic.
+     */
+    public void logLikelihood(int[] residues, double[][][] sigma, double[] lambda, double[] lambdaA, double[] sJ,
+                              double[] logL, int[] status) {
         if (closed) throw new IllegalStateException("engine closed");
         final int k = residues.length;
         if (sigma.length != k || lambda.length != k || logL.length < k) {
             throw new IllegalArgumentException("residues, sigma, lambda and logL must have matching lengths");
+        }
+        if ((lambdaA == null) != (sJ == null) || (lambdaA != null && (lambdaA.length != k || sJ.length != k))) {
+            throw new IllegalArgumentException("lambdaA and sJ must both be null or both have one value per residue");
         }
         for (int i = 0; i < k; i++) {
             if (residues[i] < 0 || residues[i] >= nResidues) throw new IllegalArgumentException("residue out of range");
@@ -294,32 +311,48 @@ public final class TorusLandingGpuEngine implements AutoCloseable {
             if (!Double.isFinite(lam) || lam < 0.0) {
                 throw new IllegalArgumentException("landing jumpRate must be finite and nonnegative");
             }
+            if (lambdaA != null) {
+                if (!Double.isFinite(lambdaA[i]) || lambdaA[i] < 0.0) {
+                    throw new IllegalArgumentException("additive jump rate must be finite and nonnegative");
+                }
+                if (lambdaA[i] > 0.0 && !(Double.isFinite(sJ[i]) && sJ[i] > 0.0)) {
+                    throw new IllegalArgumentException("additive jump size must be finite and positive");
+                }
+            }
             requireLandingCovariance(sigma[i], "Diffusion covariance");
         }
         cuCtxSetCurrent(context);
         for (int start = 0; start < k; start += maxBatch) {
             final int b = Math.min(maxBatch, k - start);
-            evaluateChunk(residues, sigma, lambda, start, b, logL, status);
+            evaluateChunk(residues, sigma, lambda, lambdaA, sJ, start, b, logL, status);
         }
         evaluations += k;
     }
 
-    private void evaluateChunk(int[] residues, double[][][] sigma, double[] lambda, int start, int B, double[] logL,
-                               int[] status) {
+    private void evaluateChunk(int[] residues, double[][][] sigma, double[] lambda, double[] lambdaA, double[] sJ,
+                               int start, int B, double[] logL, int[] status) {
         final int[] rmap = new int[B];
         final double[] sig = new double[4 * B];
         final double[] lam = new double[B];
+        final double[] lamA = new double[B];
+        final double[] sj2 = new double[B];
         boolean anyZero = false, anyPositive = false;
         for (int b = 0; b < B; b++) {
             rmap[b] = residues[start + b];
             final double[][] s = sigma[start + b];
             sig[4 * b] = s[0][0]; sig[4 * b + 1] = s[0][1]; sig[4 * b + 2] = s[1][0]; sig[4 * b + 3] = s[1][1];
             lam[b] = lambda[start + b];
+            if (lambdaA != null && lambdaA[start + b] > 0.0) {
+                lamA[b] = lambdaA[start + b];
+                sj2[b] = sJ[start + b] * sJ[start + b];
+            }
             if (lam[b] == 0.0) anyZero = true; else anyPositive = true;
         }
         cuMemcpyHtoD(dRmap, Pointer.to(rmap), 4L * B);
         cuMemcpyHtoD(dSig, Pointer.to(sig), 8L * 4 * B);
         cuMemcpyHtoD(dLam, Pointer.to(lam), 8L * B);
+        cuMemcpyHtoD(dLamA, Pointer.to(lamA), 8L * B);
+        cuMemcpyHtoD(dSj2, Pointer.to(sj2), 8L * B);
         cuMemsetD32(dBad, 0, B);
         final cufftHandle plan = plan(B);
 
@@ -335,7 +368,8 @@ public final class TorusLandingGpuEngine implements AutoCloseable {
                 launch(fTipPhases, (n + BLOCK - 1) / BLOCK, B, Pointer.to(dT), Pointer.to(theta), Pointer.to(dRmap),
                         Pointer.to(new int[]{n}));
                 launch(fTipApply, nblk, B, Pointer.to(dX), Pointer.to(dT), Pointer.to(dTipMag), Pointer.to(dGhat),
-                        Pointer.to(dSig), Pointer.to(dLam), Pointer.to(new double[]{t}), Pointer.to(new int[]{n}),
+                        Pointer.to(dSig), Pointer.to(dLam), Pointer.to(dLamA), Pointer.to(dSj2),
+                        Pointer.to(new double[]{t}), Pointer.to(new int[]{n}),
                         Pointer.to(new int[]{nTotal}), Pointer.to(dPart));
                 correctionAndInverse(B, plan);
                 launch(fCombine, nblk, B, Pointer.to(P), Pointer.to(dX), Pointer.to(present), Pointer.to(dRmap),
@@ -367,7 +401,8 @@ public final class TorusLandingGpuEngine implements AutoCloseable {
             launch(fLoad, nblk, B, Pointer.to(dX), Pointer.to(Proot), Pointer.to(new int[]{nTotal}));
             JCufft.cufftExecZ2Z(plan, dX, dX, JCufft.CUFFT_FORWARD);
             launch(fRootSum, nblk, B, Pointer.to(dX), Pointer.to(dGhat), Pointer.to(dSig), Pointer.to(dLam),
-                    Pointer.to(new int[]{n}), Pointer.to(new int[]{nTotal}), Pointer.to(dPart));
+                    Pointer.to(dLamA), Pointer.to(dSj2), Pointer.to(new int[]{n}), Pointer.to(new int[]{nTotal}),
+                    Pointer.to(dPart));
             launch1(fFinalize, B, Pointer.to(dPart), Pointer.to(new int[]{nblk}), Pointer.to(dOut));
         }
         final double[] sums = new double[B], means = new double[B], rootScale = new double[B];
@@ -403,7 +438,8 @@ public final class TorusLandingGpuEngine implements AutoCloseable {
     /** apply_landing + add_correction + inverse transform, on dX (internal children only). */
     private void branchOperator(double t, int B, cufftHandle plan) {
         launch(fApply, nblk, B, Pointer.to(dX), Pointer.to(dGhat), Pointer.to(dSig), Pointer.to(dLam),
-                Pointer.to(new double[]{t}), Pointer.to(new int[]{n}), Pointer.to(new int[]{nTotal}), Pointer.to(dPart));
+                Pointer.to(dLamA), Pointer.to(dSj2), Pointer.to(new double[]{t}), Pointer.to(new int[]{n}),
+                Pointer.to(new int[]{nTotal}), Pointer.to(dPart));
         correctionAndInverse(B, plan);
     }
 
@@ -478,7 +514,7 @@ public final class TorusLandingGpuEngine implements AutoCloseable {
         for (cufftHandle p : plans.values()) JCufft.cufftDestroy(p);
         plans.clear();
         final List<CUdeviceptr> all = new ArrayList<CUdeviceptr>(Arrays.asList(dX, dT, dScale, dPart, dBlkMax, dBad, dOut,
-                dOutMean, dGhat, dTipMag, dSig, dLam, dRmap, dTheta, dPresent));
+                dOutMean, dGhat, dTipMag, dSig, dLam, dLamA, dSj2, dRmap, dTheta, dPresent));
         all.addAll(Arrays.asList(dP));
         for (CUdeviceptr p : all) cuMemFree(p);
         cuModuleUnload(module);

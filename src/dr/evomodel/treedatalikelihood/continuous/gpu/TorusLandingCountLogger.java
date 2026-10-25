@@ -74,6 +74,7 @@ public final class TorusLandingCountLogger implements Logger {
     private final int K;                                // regions (3 coarse states or 6 basins), from the region file
     private final String[] regionNames;
     private final TorusLandingGpuLikelihood likelihood;
+    private final boolean combined;                     // landing AND additive jumps: records gain lambdaA, sJ
     private final Tree tree;
     private final String[] residueIds;
     private final boolean[] conserved;
@@ -100,6 +101,7 @@ public final class TorusLandingCountLogger implements Logger {
                                    boolean async, double logLTol, double conservedSd, double conservedMax,
                                    String settings) {
         this.likelihood = likelihood;
+        this.combined = likelihood.isCombined();
         this.tree = tree;
         this.residueIds = residueIds.clone();
         this.nResidues = residueIds.length;
@@ -208,6 +210,7 @@ public final class TorusLandingCountLogger implements Logger {
             for (int a = 0; a < K; a++) for (int b = 0; b < K; b++) h.append("\tN_").append(a).append(b);
             for (int a = 0; a < K; a++) for (int b = 0; b < K; b++) h.append("\tNc_").append(a).append(b);
             h.append("\tclip_all\tclip_change\tC\tQ\tn_panels\tn_terms\tstatus\tsec");
+            if (combined) h.append("\tlambdaA\tsJ");           // combined model only: landing-only format unchanged
             records.println(h);
             records.flush();
             branchOut = new BufferedOutputStream(new FileOutputStream(new File(outDir, "branch.bin")), 1 << 20);
@@ -222,17 +225,23 @@ public final class TorusLandingCountLogger implements Logger {
         try {
             final double[][] P = new double[nResidues][];
             final double[] lam = new double[nResidues];
+            final double[] lamA = new double[nResidues], sJ = new double[nResidues];
             final double[] chainLogL = new double[nResidues];
             final Parameter jr = likelihood.getJumpRate();
+            final Parameter ar = likelihood.getAdditiveRate(), as = likelihood.getAdditiveSize();
             for (int r = 0; r < nResidues; r++) {
                 final MatrixParameter p = likelihood.getPrecision(r);
                 P[r] = new double[]{p.getParameterValue(0, 0), p.getParameterValue(0, 1), p.getParameterValue(1, 0),
                         p.getParameterValue(1, 1)};
                 lam[r] = jr.getParameterValue(jr.getDimension() == 1 ? 0 : r);
-                chainLogL[r] = view.cachedResidueLogL(r, P[r], lam[r]);
+                if (combined) {
+                    lamA[r] = ar.getParameterValue(ar.getDimension() == 1 ? 0 : r);
+                    sJ[r] = as.getParameterValue(as.getDimension() == 1 ? 0 : r);
+                }
+                chainLogL[r] = view.cachedResidueLogL(r, P[r], lam[r], lamA[r], sJ[r]);
             }
-            if (async) writer.submit(() -> countState(state, P, lam, chainLogL));
-            else countState(state, P, lam, chainLogL);
+            if (async) writer.submit(() -> countState(state, P, lam, lamA, sJ, chainLogL));
+            else countState(state, P, lam, lamA, sJ, chainLogL);
         } catch (Throwable t) {
             failures++;
             log.severe("TorusLandingCountLogger: state " + state + " not counted: " + t);
@@ -261,7 +270,7 @@ public final class TorusLandingCountLogger implements Logger {
 
     // ---- counting one state
 
-    private void countState(long state, double[][] P, double[] lam, double[] chainLogL) {
+    private void countState(long state, double[][] P, double[] lam, double[] lamA, double[] sJ, double[] chainLogL) {
         final long t0 = System.nanoTime();
         final TorusLandingCountEngine.Result[] res = new TorusLandingCountEngine.Result[nResidues];
         final double[][][] sig = new double[nResidues][][];
@@ -274,7 +283,11 @@ public final class TorusLandingCountLogger implements Logger {
                     if (engineOf[r] != ee) continue;
                     try {
                         sig[r] = TorusLandingGpuEngine.invertPrecision(new double[][]{{P[r][0], P[r][1]}, {P[r][2], P[r][3]}});
-                        if (!conserved[r]) res[r] = engines[ee].count(localIndex[r], sig[r], lam[r], TorusLandingCountEngine.C1, 1);
+                        if (!conserved[r]) {
+                            res[r] = combined
+                                    ? engines[ee].count(localIndex[r], sig[r], lam[r], lamA[r], sJ[r], TorusLandingCountEngine.C1, 1)
+                                    : engines[ee].count(localIndex[r], sig[r], lam[r], TorusLandingCountEngine.C1, 1);
+                        }
                     } catch (Throwable t) {
                         err[r] = t.toString();
                     }
@@ -284,11 +297,11 @@ public final class TorusLandingCountLogger implements Logger {
         for (Future<?> f : jobs) {
             try { f.get(); } catch (Throwable t) { log.severe("TorusLandingCountLogger: device task: " + t); }
         }
-        write(state, P, lam, chainLogL, sig, res, err, (System.nanoTime() - t0) * 1e-9);
+        write(state, P, lam, lamA, sJ, chainLogL, sig, res, err, (System.nanoTime() - t0) * 1e-9);
     }
 
-    private synchronized void write(long state, double[][] P, double[] lam, double[] chainLogL, double[][][] sig,
-                                    TorusLandingCountEngine.Result[] res, String[] err, double sec) {
+    private synchronized void write(long state, double[][] P, double[] lam, double[] lamA, double[] sJ, double[] chainLogL,
+                                    double[][][] sig, TorusLandingCountEngine.Result[] res, String[] err, double sec) {
         final ByteBuffer bb = ByteBuffer.allocate(4 * 2 * nodeCount).order(ByteOrder.LITTLE_ENDIAN);
         try {
             for (int r = 0; r < nResidues; r++) {
@@ -343,6 +356,7 @@ public final class TorusLandingCountLogger implements Logger {
                 b.append('\t').append(clipAll).append('\t').append(clipChange).append('\t').append(C).append('\t').append(Q);
                 b.append('\t').append(x == null ? 0 : x.nPanels).append('\t').append(x == null ? 0 : x.nTerms);
                 b.append('\t').append(status).append('\t').append(x == null ? 0.0 : x.secTotal);
+                if (combined) b.append('\t').append(lamA[r]).append('\t').append(sJ[r]);
                 records.println(b);
                 branchOut.write(bb.array());
             }
@@ -382,6 +396,11 @@ public final class TorusLandingCountLogger implements Logger {
         b.append(", \"start_state\": ").append(startState).append(", \"async\": ").append(async);
         b.append(", \"logL_tol\": ").append(logLTol).append(", \"neg_tol\": ").append(NEG_TOL);
         b.append(", \"settings\": ").append(json(settings));
+        if (combined) {
+            b.append(", \"model\": \"combined: landing AND additive jumps; counts are landings only\"");
+            b.append(", \"additive_rate\": ").append(json(likelihood.getAdditiveRate().getId()));
+            b.append(", \"additive_size\": ").append(json(likelihood.getAdditiveSize().getId()));
+        }
         b.append(", \"branch_bin\": \"float32 little-endian, per record (records.tsv order) and node: clipped landings, clipped state changes\"");
         if (stopped) b.append(", \"completed\": true, \"counted_states\": ").append(countedStates).append(", \"failures\": ").append(failures);
         b.append("}\n");
@@ -436,8 +455,8 @@ public final class TorusLandingCountLogger implements Logger {
             return f;
         }
 
-        /** the chain's cached log L of residue r if it is current for exactly (P, lambda), else NaN */
-        double cachedResidueLogL(int r, double[] P, double lambda) {
+        /** the chain's cached log L of residue r if it is current for exactly (P, lambda[, lambdaA, sJ]), else NaN */
+        double cachedResidueLogL(int r, double[] P, double lambda, double lambdaA, double sJ) {
             try {
                 if (!known.getBoolean(lik)) return Double.NaN;
                 if (!((boolean[]) keyValid.get(lik))[r]) return Double.NaN;
@@ -447,6 +466,8 @@ public final class TorusLandingCountLogger implements Logger {
                         || Double.doubleToRawLongBits(k[2]) != Double.doubleToRawLongBits(P[2])
                         || Double.doubleToRawLongBits(k[3]) != Double.doubleToRawLongBits(P[3])
                         || Double.doubleToRawLongBits(k[4]) != Double.doubleToRawLongBits(lambda)) return Double.NaN;
+                if (k.length == 7 && (Double.doubleToRawLongBits(k[5]) != Double.doubleToRawLongBits(lambdaA)
+                        || Double.doubleToRawLongBits(k[6]) != Double.doubleToRawLongBits(sJ))) return Double.NaN;
                 return ((double[]) residueLogL.get(lik))[r];
             } catch (IllegalAccessException e) {
                 return Double.NaN;
