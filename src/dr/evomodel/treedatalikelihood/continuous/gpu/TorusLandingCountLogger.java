@@ -429,6 +429,7 @@ public final class TorusLandingCountLogger implements Logger {
     }
 
     private static String json(String s) {
+        if (s == null) return "null";                       // e.g. an inline <parameter> with no id attribute
         return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
     }
 

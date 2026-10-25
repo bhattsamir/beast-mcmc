@@ -291,7 +291,14 @@ public class TorusResidueBlockOperator extends SimpleMCMCOperator implements Gib
         return s;
     }
 
-    /** The leaf components of 'prior' whose value changes when all of residue r's parameters change. */
+    /**
+     * The leaf components of 'prior' that depend on residue r: each of r's D parameters is moved ON ITS OWN (q1 x1.7,
+     * q2 x0.6, rho by 0.4 b, lambda x1.7 [, lambda_A x1.7, s_J x0.6]) and every leaf whose value changes (or turns NaN)
+     * under any of the moves is kept, in leaf order. Moving one parameter at a time catches priors that depend on a
+     * combination (a ratio lambda / lambda_A, for example) which a joint move with shared factors would leave unchanged.
+     * Also refuses to start if a log-transformed parameter is not strictly positive and finite, or |rho| >= b: such a
+     * residue could never be moved (its u would be infinite) and would otherwise stay frozen without any error.
+     */
     private void discoverPriorDependencies() {
         final List<Likelihood> leaves = new ArrayList<Likelihood>();
         flatten(prior, leaves);
@@ -301,29 +308,46 @@ public class TorusResidueBlockOperator extends SimpleMCMCOperator implements Gib
         int links = 0;
         for (int r = 0; r < R; r++) {
             read(r, x);
-            y[0] = 1.7 * x[0];
-            y[1] = 0.6 * x[1];
-            y[2] = Math.abs(x[2]) < 0.5 * bound ? x[2] + 0.4 * bound : x[2] - Math.signum(x[2]) * 0.4 * bound;
-            y[3] = 1.7 * x[3];
-            if (D == 6) {
-                y[4] = 1.7 * x[4];
-                y[5] = 0.6 * x[5];
+            for (int i = 0; i < D; i++) {
+                if (i == 2) continue;
+                if (!(x[i] > 0.0) || !Double.isFinite(x[i])) {
+                    throw new IllegalStateException(getOperatorName() + ": residue " + r + " starts with parameter " + i
+                            + " = " + x[i] + "; the block moves it on the log scale, so it must start strictly positive and"
+                            + " finite (a start at 0 would never move)");
+                }
+            }
+            if (!(Math.abs(x[2]) < bound)) {
+                throw new IllegalStateException(getOperatorName() + ": residue " + r + " starts with correlation " + x[2]
+                        + " outside (-" + bound + ", " + bound + ")");
             }
             final double[] before = new double[leaves.size()];
             for (int c = 0; c < before.length; c++) before[c] = leaves.get(c).getLogLikelihood();
-            write(r, y);
-            final List<Likelihood> dep = new ArrayList<Likelihood>();
-            for (int c = 0; c < before.length; c++) {
-                final double after = leaves.get(c).getLogLikelihood();
-                if (!(after == before[c])) dep.add(leaves.get(c));   // NaN or a change counts as dependence
+            final boolean[] depends = new boolean[before.length];
+            for (int k = 0; k < D; k++) {
+                System.arraycopy(x, 0, y, 0, D);
+                switch (k) {
+                    case 0: y[0] = 1.7 * x[0]; break;
+                    case 1: y[1] = 0.6 * x[1]; break;
+                    case 2: y[2] = Math.abs(x[2]) < 0.5 * bound ? x[2] + 0.4 * bound : x[2] - Math.signum(x[2]) * 0.4 * bound; break;
+                    case 3: y[3] = 1.7 * x[3]; break;
+                    case 4: y[4] = 1.7 * x[4]; break;
+                    default: y[5] = 0.6 * x[5]; break;
+                }
+                write(r, y);
+                for (int c = 0; c < before.length; c++) {
+                    final double after = leaves.get(c).getLogLikelihood();
+                    if (!(after == before[c])) depends[c] = true;    // NaN or a change counts as dependence
+                }
+                write(r, x);
             }
-            write(r, x);
+            final List<Likelihood> dep = new ArrayList<Likelihood>();
+            for (int c = 0; c < before.length; c++) if (depends[c]) dep.add(leaves.get(c));
             residuePriors[r] = dep.toArray(new Likelihood[0]);
             links += dep.size();
         }
         Logger.getLogger("dr.inference").info(getOperatorName() + ": " + leaves.size() + " prior components; "
                 + links + " residue-component dependencies found (" + String.format("%.2f", links / (double) R)
-                + " per residue); the posterior guard is " + (posterior == null ? "OFF" : "on"));
+                + " per residue, each parameter moved on its own); the posterior guard is " + (posterior == null ? "OFF" : "on"));
     }
 
     private static void flatten(Likelihood l, List<Likelihood> out) {
