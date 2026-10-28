@@ -57,7 +57,11 @@ import static jcuda.driver.JCudaDriver.*;
  *       reproduced exactly, with the NONPOSITIVE bit, when the case is well conditioned (an exact zero at a node or a
  *       robust root sign); when it is not, a different outcome is reported as NOT-REQUIRED. The mirror case, a GPU
  *       NONPOSITIVE where Python is finite, is NOT-REQUIRED only when Python's own PRECISION bound is >= 1 (round-off
- *       can reach L itself, so its sign is not determined).</li>
+ *       can reach L itself, so its sign is not determined). An ALIASED state, where both engines raise RESOLUTION
+ *       with a ratio above {@code --aliased-res} (default 1e-6, far above round-off) is NOT-REQUIRED as to its value
+ *       when the value check fails: the grid is under-resolved there, so Python's PRECISION shadow is not a bound and
+ *       either engine's value is one round-off realization (both flag the state, and neither value is usable). Only
+ *       the flags must agree there (LEAK and RESOLUTION bits; the NONPOSITIVE bit may differ).</li>
  *   <li><b>Status bits</b> must agree. A difference fails the case, except where the outcome itself is NOT-REQUIRED
  *       and only the NONPOSITIVE bit differs, or the case is on the explicit allow-list ({@code --status-allow}).</li>
  *   <li><b>Guard values</b> (LEAK, RESOLUTION, rho_min) against prec_check=False, by agreement class (exact, close =
@@ -70,15 +74,15 @@ import static jcuda.driver.JCudaDriver.*;
  *   <li><b>Invariance</b>, all bitwise: two repeats; the call order reversed; the smallest maxBatch (the most boxes of
  *       a site) with all sites in one call and with one site per call; a second device; the sites in reversed
  *       construction order; and the transform policy forced to batched and to slot by slot
- *       ({@code torus.box.fft}), which must give bitwise the engine's own result (or, forced batched at an n where
- *       cuFFT couples slots, be refused).</li>
+ *       (constructor argument fftPolicy), which must give bitwise the engine's own result (or, forced batched at an n
+ *       where cuFFT couples slots, be refused).</li>
  *   <li><b>Timing</b> per site-grid (one (site, box) slot through the whole tree), with an H100 extrapolation.</li>
  * </ol>
  * Cases with the same batch_key share the tree, n, the tip error and the mixture (checked bitwise): they run as ONE
  * engine, each case its own site.
  *
  * <p>usage: TorusBoxGpuCaseRunner CASES_DIR OUT_PREFIX [--devices 0,1] [--only REGEX] [--tiers t1,t2]
- * [--no-invariance] [--tol-cap X (0 = none)] [--status-allow NAME,NAME]. Writes OUT_PREFIX.log (also echoed to stdout) and OUT_PREFIX.tsv (one row per case).
+ * [--no-invariance] [--tol-cap X (0 = none)] [--aliased-res X (0 = none)] [--status-allow NAME,NAME]. Writes OUT_PREFIX.log (also echoed to stdout) and OUT_PREFIX.tsv (one row per case).
  * Exit status 0 when every case passes and every invariance and table check holds, 1 otherwise.
  *
  * @author Samir Bhatt
@@ -96,6 +100,7 @@ public final class TorusBoxGpuCaseRunner {
 
     private static PrintStream log;
     private static double tolCap = 1e-6;                                 // --tol-cap (<= 0: no cap)
+    private static double aliasedRes = 1e-6;                             // --aliased-res (<= 0: clause off)
     private static final Set<String> statusAllow = new HashSet<String>(); // --status-allow
 
     // =========================================================================================== case files
@@ -354,6 +359,10 @@ public final class TorusBoxGpuCaseRunner {
     }
 
     static TorusBoxGpuEngine construct(Inputs in, int[] siteOfCase, int device, int maxBatch) {
+        return construct(in, siteOfCase, device, maxBatch, TorusBoxGpuEngine.FFT_AUTO);
+    }
+
+    static TorusBoxGpuEngine construct(Inputs in, int[] siteOfCase, int device, int maxBatch, int fftPolicy) {
         final TorusBoxGpuEngine.Box[][] bx = new TorusBoxGpuEngine.Box[in.k][];
         final int[][] tb = new int[in.k][];
         final double[][][] to = new double[in.k][][];
@@ -364,7 +373,7 @@ public final class TorusBoxGpuCaseRunner {
             to[s] = in.tipOff[c];
         }
         final TorusBoxGpuEngine eng = new TorusBoxGpuEngine(in.children, in.root, in.blen, bx, tb, to, in.sigmaEps, in.w,
-                in.mu, in.S, device, maxBatch);
+                in.mu, in.S, device, maxBatch, fftPolicy);
         eng.setTolerances(LEAK_TOL, RES_TOL);
         return eng;
     }
@@ -438,6 +447,56 @@ public final class TorusBoxGpuCaseRunner {
         return f[0];
     }
 
+    /**
+     * This JVM's memory on device dev in bytes, from nvidia-smi's per-process accounting (MiB resolution), so that
+     * other processes on the same GPU do not enter the figure (a device-wide free-memory difference does). others[0]
+     * receives the number of OTHER compute processes on the device. -1 when nvidia-smi is unavailable or does not
+     * list this process on the device.
+     */
+    static long processDeviceBytes(int dev, int[] others) {
+        others[0] = 0;
+        deviceFree(dev);                                // the primary context is held, so this process is listed
+        try {
+            final String[] bus = new String[1];
+            cuDeviceGetPCIBusId(bus, 64, deviceOf(dev));
+            final String mine = normBus(bus[0]);
+            final String pid = java.lang.management.ManagementFactory.getRuntimeMXBean().getName().split("@")[0];
+            final Process p = new ProcessBuilder("nvidia-smi", "--query-compute-apps=pid,gpu_bus_id,used_memory",
+                    "--format=csv,noheader,nounits").redirectErrorStream(true).start();
+            long bytes = -1L;
+            try (java.io.BufferedReader br = new java.io.BufferedReader(new InputStreamReader(p.getInputStream(),
+                    StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    final String[] f = line.split(",");
+                    if (f.length < 3 || !normBus(f[1]).equals(mine)) continue;
+                    if (f[0].trim().equals(pid)) {
+                        bytes = Long.parseLong(f[2].trim()) * 1048576L;
+                    } else {
+                        others[0]++;
+                    }
+                }
+            }
+            return p.waitFor() == 0 ? bytes : -1L;
+        } catch (IOException | InterruptedException | RuntimeException e) {
+            return -1L;
+        }
+    }
+
+    static CUdevice deviceOf(int dev) {
+        final CUdevice d = new CUdevice();
+        cuDeviceGet(d, dev);
+        return d;
+    }
+
+    /** A PCI bus id (domain:bus:device.function, any width of hex fields) as comparable text. */
+    static String normBus(String s) {
+        final String[] f = s.trim().toLowerCase(Locale.ROOT).split("[:.]");
+        final StringBuilder b = new StringBuilder();
+        for (String x : f) b.append(Long.parseLong(x, 16)).append('/');
+        return b.toString();
+    }
+
     static void copyRow(Res from, int i, Res to, int j) {
         to.logL[j] = from.logL[i];
         to.leak[j] = from.leak[i];
@@ -478,6 +537,7 @@ public final class TorusBoxGpuCaseRunner {
         double gpu = Double.NaN, leak = Double.NaN, res = Double.NaN, rho = Double.NaN, tol = Double.NaN, diff = Double.NaN;
         int status = -1;
         String verdict = "ERROR", note = "", leakClass = "-", resClass = "-", rhoClass = "-";
+        String notRequiredWhy = "";                    // PRECISION>=1 | not well conditioned | aliased
         boolean statusMatch, statusAllowed, tolCapped;
         double gpuSeconds = Double.NaN;
 
@@ -503,8 +563,15 @@ public final class TorusBoxGpuCaseRunner {
             r.diff = Math.abs(r.gpu - c.expLogL);
             if (Double.isFinite(r.gpu) && r.diff <= r.tol) {
                 r.verdict = "PASS";
+            } else if (aliased(r)) {
+                r.verdict = "NOT-REQUIRED";
+                r.notRequiredWhy = "aliased";
+                r.note += "aliased state: both engines raise RESOLUTION (GPU " + sci(r.res) + ", Python " + sci(c.expRes)
+                        + " > " + sci(aliasedRes) + "), so Python's PRECISION " + sci(c.prec) + " is not a bound there; GPU "
+                        + r.gpu + " status " + r.status + ", |d| " + sci(r.diff) + "; value agreement not required, flags must agree; ";
             } else if (!Double.isFinite(r.gpu) && (r.status & TorusBoxGpuEngine.STATUS_NONPOSITIVE) != 0 && c.prec >= 1.0) {
                 r.verdict = "NOT-REQUIRED";
+                r.notRequiredWhy = "PRECISION>=1";
                 r.note += "GPU NONPOSITIVE (" + r.gpu + ") where Python is finite, but Python's own PRECISION bound "
                         + sci(c.prec) + " is >= 1: round-off reaches L itself, its sign is not determined; ";
             } else {
@@ -522,8 +589,15 @@ public final class TorusBoxGpuCaseRunner {
                         + (c.rootRobust ? ", robust root" : "") + "); ";
             } else if (!c.wellConditioned) {
                 r.verdict = "NOT-REQUIRED";
+                r.notRequiredWhy = "not well conditioned";
                 r.note += "Python NONPOSITIVE (" + c.nonpositive + ") with a sign round-off can flip; GPU gave " + r.gpu
                         + " status " + r.status + "; ";
+            } else if (aliased(r)) {
+                r.verdict = "NOT-REQUIRED";
+                r.notRequiredWhy = "aliased";
+                r.note += "aliased state: Python NONPOSITIVE (" + c.nonpositive + ") where both engines raise RESOLUTION (GPU "
+                        + sci(r.res) + ", Python " + sci(c.expRes) + " > " + sci(aliasedRes) + "); GPU gave " + r.gpu
+                        + " status " + r.status + "; flags must agree; ";
             } else {
                 r.verdict = "FAIL";
                 r.note += "Python NONPOSITIVE (" + c.nonpositive + ", well conditioned) not reproduced: GPU " + r.gpu
@@ -552,6 +626,17 @@ public final class TorusBoxGpuCaseRunner {
         r.leakClass = guardClass(r.leak, c.expLeak);
         r.resClass = guardClass(r.res, c.expRes);
         r.rhoClass = guardClass(r.rho, c.expRho);
+    }
+
+    /**
+     * An aliased state: both engines raise RESOLUTION, each with a ratio above aliasedRes (far above round-off). The
+     * grid does not resolve the message there, round-off is amplified without a usable bound (Python's PRECISION
+     * shadow assumes a resolved grid), and the state is unusable in both engines (status != 0).
+     */
+    static boolean aliased(Row r) {
+        final int R = TorusBoxGpuEngine.STATUS_RESOLUTION;
+        return aliasedRes > 0 && (r.status & R) != 0 && (r.c.expStatus & R) != 0 && r.res > aliasedRes
+                && r.c.expRes > aliasedRes;
     }
 
     /** exact | close (1e-6 relative or 1e-13 absolute) | magnitude (within 10x) | differ. */
@@ -897,7 +982,9 @@ public final class TorusBoxGpuCaseRunner {
         String group;
         int n, nodes, slots, sites;
         double construct, perCall;
-        long deviceBytes;
+        long deviceBytes;                              // device-wide free-memory difference (any process)
+        long procBytes = -1L;                          // this process (nvidia-smi), -1 = not available
+        int otherProcs;                                // other compute processes on the device during the reading
         final List<double[]> perSite = new ArrayList<double[]>();      // {boxes, seconds}
         double numpySeconds;
     }
@@ -918,11 +1005,16 @@ public final class TorusBoxGpuCaseRunner {
         final Res a1, a2, aRev;
         int[] fftA = null;                                 // engine A's {fft mode, slot-independent, single-equivalent}
         final Timing tm = new Timing();
+        final int[] oth0 = new int[1], oth1 = new int[1];
+        final long proc0 = processDeviceBytes(devices[0], oth0);
         final long free0 = deviceFree(devices[0]);
         long t0 = System.nanoTime();
         try (TorusBoxGpuEngine eng = construct(in, ident, devices[0], in.nSlots)) {
             tm.construct = (System.nanoTime() - t0) * 1e-9;
             tm.deviceBytes = free0 - deviceFree(devices[0]);
+            final long proc1 = processDeviceBytes(devices[0], oth1);
+            tm.procBytes = proc0 >= 0 && proc1 >= 0 ? proc1 - proc0 : -1L;
+            tm.otherProcs = Math.max(oth0[0], oth1[0]);
             // parameter-free values against the case headers
             // (the engine evaluates them in Java: Math.exp may differ from numpy's exp by an ulp, so relative, not bitwise)
             int mcutBad = 0, tlBits = 0, trBits = 0;
@@ -945,8 +1037,12 @@ public final class TorusBoxGpuCaseRunner {
                     tm.construct, eng.getMcut(), mcutBad == 0 ? "= cases" : mcutBad + " differ", eng.getGSup(), c0.dbl("g_sup"),
                     tlBits, k, trBits, k, eng.getBufferCount());
             log.println("   engine A transforms: " + eng.describeTransforms());
-            log.printf(Locale.ROOT, "   engine A device memory: %.1f MiB (maxBatch %d, %d slots, %d buffers, %d observed site-tips)%n",
-                    tm.deviceBytes / 1048576.0, eng.getMaxBatch(), eng.getSlotCount(), eng.getBufferCount(), observedTips(in));
+            log.printf(Locale.ROOT, "   engine A device memory: %s (maxBatch %d, %d slots, %d buffers, %d observed site-tips); "
+                            + "device-wide free-memory difference %.1f MiB%s%n",
+                    tm.procBytes >= 0 ? String.format(Locale.ROOT, "%.0f MiB (this process, nvidia-smi)", tm.procBytes / 1048576.0)
+                            : "n/a (nvidia-smi does not list this process)",
+                    eng.getMaxBatch(), eng.getSlotCount(), eng.getBufferCount(), observedTips(in), tm.deviceBytes / 1048576.0,
+                    tm.otherProcs > 0 ? " (NOT this engine's: " + tm.otherProcs + " other compute process(es) on the device)" : "");
             fftA = new int[]{eng.getFftMode(), eng.isFftSlotIndependent() ? 1 : 0, eng.isFftSingleEquivalent() ? 1 : 0};
 
             a1 = call(eng, in, ident, ident, null);
@@ -1034,12 +1130,11 @@ public final class TorusBoxGpuCaseRunner {
                 log.println("   ENGINE D RAISED: " + e);
             }
         }
-        // ---- engines E and F: the transform policy forced (system property torus.box.fft, read at construction)
+        // ---- engines E and F: the transform policy forced (constructor argument fftPolicy)
         if (fftA != null && in.nSlots > 1) {
             final boolean indep = fftA[1] == 1, equiv = fftA[2] == 1;
             try {
-                System.setProperty("torus.box.fft", "batched");
-                try (TorusBoxGpuEngine eng = construct(in, ident, devices[0], in.nSlots)) {
+                try (TorusBoxGpuEngine eng = construct(in, ident, devices[0], in.nSlots, TorusBoxGpuEngine.FFT_BATCHED)) {
                     final Res e1 = call(eng, in, ident, ident, null);
                     // one site per call pads every batched transform to maxBatch (all slots): at most three sites
                     final int[] few = k <= 3 ? identity(k) : new int[]{0, k / 2, k - 1};
@@ -1073,13 +1168,10 @@ public final class TorusBoxGpuCaseRunner {
             } catch (RuntimeException e) {
                 inv.failed.add(tag + ": engine E (forced batched) raised " + e);
                 log.println("   ENGINE E RAISED: " + e);
-            } finally {
-                System.clearProperty("torus.box.fft");
             }
             if (equiv || !indep) {
                 try {
-                    System.setProperty("torus.box.fft", "slotwise");
-                    try (TorusBoxGpuEngine eng = construct(in, ident, devices[0], in.nSlots)) {
+                    try (TorusBoxGpuEngine eng = construct(in, ident, devices[0], in.nSlots, TorusBoxGpuEngine.FFT_SLOTWISE)) {
                         final Res f1 = call(eng, in, ident, ident, null);
                         check(inv, tag + ": transforms forced slot by slot bitwise", bitwise(a1, f1, cases));
                         log.printf(Locale.ROOT, "   engine F (forced slotwise: %s): %.3f s%n", eng.describeTransforms(), f1.total);
@@ -1087,8 +1179,6 @@ public final class TorusBoxGpuCaseRunner {
                 } catch (RuntimeException e) {
                     inv.failed.add(tag + ": engine F (forced slotwise) raised " + e);
                     log.println("   ENGINE F RAISED: " + e);
-                } finally {
-                    System.clearProperty("torus.box.fft");
                 }
             } else {
                 inv.skipped.add(tag + ": forced slot by slot (single-slot plans are not bitwise equal to the batched ones here)");
@@ -1115,7 +1205,7 @@ public final class TorusBoxGpuCaseRunner {
 
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
-            System.err.println("usage: TorusBoxGpuCaseRunner CASES_DIR OUT_PREFIX [--devices 0,1] [--only REGEX] [--tiers t1,t2] [--no-invariance] [--tol-cap X] [--status-allow NAME,NAME]");
+            System.err.println("usage: TorusBoxGpuCaseRunner CASES_DIR OUT_PREFIX [--devices 0,1] [--only REGEX] [--tiers t1,t2] [--no-invariance] [--tol-cap X] [--aliased-res X] [--status-allow NAME,NAME]");
             System.exit(2);
         }
         final File casesDir = new File(args[0]);
@@ -1136,6 +1226,7 @@ public final class TorusBoxGpuCaseRunner {
                 case "--tiers": tiers = new HashSet<String>(Arrays.asList(args[++i].split(","))); break;
                 case "--no-invariance": invariance = false; break;
                 case "--tol-cap": tolCap = Double.parseDouble(args[++i]); break;
+                case "--aliased-res": aliasedRes = Double.parseDouble(args[++i]); break;
                 case "--status-allow": statusAllow.addAll(Arrays.asList(args[++i].split(","))); break;
                 default: throw new IllegalArgumentException("unknown option " + args[i]);
             }
@@ -1148,8 +1239,9 @@ public final class TorusBoxGpuCaseRunner {
         log.println("rule: finite logL passes iff |GPU - Python(prec_check False)| <= max(1e-9, min(0.3 x PRECISION bound, cap "
                 + (tolCap > 0 ? sci(tolCap) : "off") + ")); a non-finite expected value must be reproduced with NONPOSITIVE when "
                 + "well conditioned (else NOT-REQUIRED); a GPU NONPOSITIVE where Python is finite is NOT-REQUIRED iff the "
-                + "PRECISION bound is >= 1; status bits must agree (allowed: the NONPOSITIVE bit of a NOT-REQUIRED outcome, "
-                + "and --status-allow " + statusAllow + ")");
+                + "PRECISION bound is >= 1; a value that fails where both engines raise RESOLUTION above "
+                + (aliasedRes > 0 ? sci(aliasedRes) : "(clause off)") + " (an aliased state) is NOT-REQUIRED; status bits must "
+                + "agree (allowed: the NONPOSITIVE bit of a NOT-REQUIRED outcome, and --status-allow " + statusAllow + ")");
 
         // ---- cases from index.tsv, grouped by batch_key in index order
         final List<String> lines = Files.readAllLines(new File(casesDir, "index.tsv").toPath(), StandardCharsets.UTF_8);
@@ -1251,9 +1343,14 @@ public final class TorusBoxGpuCaseRunner {
                         r.status, r.c.expStatus, r.note);
             }
         }
+        final Map<String, Integer> nrWhy = new LinkedHashMap<String, Integer>();
         for (Row r : rows) {
-            if (r.verdict.equals("NOT-REQUIRED")) log.printf(Locale.ROOT, "   NOT-REQUIRED %s: %s%n", r.c.name, r.note);
+            if (r.verdict.equals("NOT-REQUIRED")) {
+                nrWhy.merge(r.notRequiredWhy, 1, Integer::sum);
+                log.printf(Locale.ROOT, "   NOT-REQUIRED (%s) %s: %s%n", r.notRequiredWhy, r.c.name, r.note);
+            }
         }
+        if (!nrWhy.isEmpty()) log.println("   NOT-REQUIRED by reason: " + nrWhy);
         // worst finite agreements relative to their tolerance
         final List<Row> fin = new ArrayList<Row>();
         for (Row r : rows) if (Double.isFinite(r.c.expLogL) && Double.isFinite(r.diff)) fin.add(r);

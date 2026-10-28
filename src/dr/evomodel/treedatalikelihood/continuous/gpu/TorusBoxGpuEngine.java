@@ -178,8 +178,12 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
     /** FFT_BATCHED: every transform batched (padding, idle slots zeroed); FFT_SLOTWISE: every transform slot by slot
      *  (cuFFT's batched plan couples slots at this n); FFT_HYBRID: both verified bitwise equal, chosen per transform. */
     public static final int FFT_BATCHED = 0, FFT_HYBRID = 1, FFT_SLOTWISE = 2;
+    /** Constructor fftPolicy: choose by the construction self-test (the default; see setupTransforms). */
+    public static final int FFT_AUTO = -1;
+    private final int fftPolicy;                       // FFT_AUTO, or FFT_BATCHED / FFT_SLOTWISE forced (tests)
     private int fftMode;
     private boolean fftIndependent, fftEquivalent, fftTested;
+    private boolean fftKeepsInput;                     // the D2Z plans left their input bitwise unchanged (d2zInputTest)
     private final List<CUdeviceptr> allocations = new ArrayList<CUdeviceptr>();
     private final byte[] codesHost;                    // [op][site] product code (0 skip, 1 first, 2 multiply)
     private final int[] tipBoxHost;                    // [tip ordinal][site] box of the tip's observation, -1 = missing
@@ -224,6 +228,24 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
     public TorusBoxGpuEngine(int[][] children, int root, double[] branchLength, Box[][] boxes, int[][] tipBox,
                              double[][][] tipOffset, double[][] sigmaEps, double[] w, double[][] mu, double[][][] s,
                              int deviceId, int maxBatch) {
+        this(children, root, branchLength, boxes, tipBox, tipOffset, sigmaEps, w, mu, s, deviceId, maxBatch, FFT_AUTO);
+    }
+
+    /**
+     * As the 12-argument constructor, with the transform policy given explicitly (an argument of this engine, not
+     * a JVM-global setting, so engines built side by side in one JVM never affect each other).
+     *
+     * @param fftPolicy FFT_AUTO (production: the construction self-test chooses hybrid, batched or slotwise), or, for
+     *                  tests only, FFT_BATCHED (refused with IllegalStateException where the self-test finds that
+     *                  cuFFT's batched plans couple slots) or FFT_SLOTWISE (every transform slot by slot)
+     */
+    public TorusBoxGpuEngine(int[][] children, int root, double[] branchLength, Box[][] boxes, int[][] tipBox,
+                             double[][][] tipOffset, double[][] sigmaEps, double[] w, double[][] mu, double[][][] s,
+                             int deviceId, int maxBatch, int fftPolicy) {
+        if (fftPolicy != FFT_AUTO && fftPolicy != FFT_BATCHED && fftPolicy != FFT_SLOTWISE) {
+            throw new IllegalArgumentException("fftPolicy must be FFT_AUTO, FFT_BATCHED or FFT_SLOTWISE, not " + fftPolicy);
+        }
+        this.fftPolicy = fftPolicy;
         // ---- tree (box_landing.py L584-622) and schedule (L254-281)
         this.nodeCount = children.length;
         if (nodeCount < 2) throw new IllegalArgumentException("the tree needs a root and at least one tip");
@@ -536,6 +558,7 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
 
             // ---- cuFFT plans and their construction self-test (see setupTransforms)
             setupTransforms();
+            fftKeepsInput = d2zInputTest();
 
             // ---- persistent tables
             this.dOM1 = upload(om1All);
@@ -656,15 +679,13 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
      *
      * Independent and equivalent: FFT_HYBRID, each transform runs batched or slot by slot, whichever is cheaper
      * (the values are bitwise the same). Independent only: FFT_BATCHED. Not independent: FFT_SLOTWISE, every
-     * transform slot by slot (only the slots a step uses). The system property {@code torus.box.fft} = batched |
-     * slotwise forces a policy (batched refuses a coupled n). Before every BATCHED transform the slots whose content
-     * is not read afterwards (padding and idle slots) are zeroed, so its input depends on the current call alone.
+     * transform slot by slot (only the slots a step uses). The constructor argument fftPolicy = FFT_BATCHED |
+     * FFT_SLOTWISE forces a policy (tests only; batched refuses a coupled n). Before every BATCHED transform the slots
+     * whose content is not read afterwards (padding and idle slots) are zeroed, so its input depends on the current
+     * call alone.
      */
     private void setupTransforms() {
-        final String force = System.getProperty("torus.box.fft", "auto").trim().toLowerCase(java.util.Locale.ROOT);
-        if (!force.equals("auto") && !force.equals("batched") && !force.equals("slotwise")) {
-            throw new IllegalArgumentException("torus.box.fft must be auto, batched or slotwise, not " + force);
-        }
+        final String force = fftPolicy == FFT_BATCHED ? "batched" : fftPolicy == FFT_SLOTWISE ? "slotwise" : "auto";
         final boolean wantBatched = !force.equals("slotwise") && maxBatch > 1;
         final boolean wantSingle = !force.equals("batched") || maxBatch == 1;
         if (wantBatched) {
@@ -694,7 +715,7 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
         fftEquivalent = t[1];
         if (!fftIndependent) {
             if (force.equals("batched")) {
-                throw new IllegalStateException("torus.box.fft=batched, but cuFFT's batched " + n1 + " x " + n2
+                throw new IllegalStateException("fftPolicy FFT_BATCHED, but cuFFT's batched " + n1 + " x " + n2
                         + " transforms are not slot-independent on device " + deviceId);
             }
             fftMode = FFT_SLOTWISE;
@@ -796,6 +817,37 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
         return new boolean[]{indep, equiv};
     }
 
+    /**
+     * Whether every D2Z plan this engine keeps (batched and single-slot) leaves its input grid bitwise unchanged on
+     * this device and library (slot 0 holding noise, the batched plan's other slots zero). cuFFT documents only that
+     * a C2R (Z2D) may overwrite its input. The engine does not depend on the answer: no step reads the input of a
+     * D2Z after the transform (the root's root_stats and root_dot run before its D2Z). The result is reported by
+     * describeTransforms, so a device whose R2C kernels use their input as scratch is visible in the log. Uses dR and
+     * dX and leaves them zero.
+     */
+    private boolean d2zInputTest() {
+        final long NG = (long) n1 * n2, N2 = (long) n1 * n2h;
+        final long seed = 0x1A9E7B0CL;
+        boolean kept = true;
+        if (planD2Z != null) {
+            cuMemsetD8(dR, (byte) 0, maxBatch * NG * 8L);
+            fillNoise(dR, NG, seed, 1.0);
+            final double[] before = fetch(dR, NG);
+            JCufft.cufftExecD2Z(planD2Z, dR, dX);
+            kept &= Arrays.equals(fetch(dR, NG), before);
+        }
+        if (plan1D2Z != null && plan1D2Z != planD2Z) {
+            fillNoise(dR, NG, seed + 1, 1.0);
+            final double[] before = fetch(dR, NG);
+            d2zSlot(dR, 0, dX);
+            kept &= Arrays.equals(fetch(dR, NG), before);
+        }
+        cuMemsetD8(dR, (byte) 0, maxBatch * NG * 8L);
+        cuMemsetD8(dX, (byte) 0, maxBatch * N2 * 16L);
+        cuCtxSynchronize();
+        return kept;
+    }
+
     private void fillNoise(CUdeviceptr out, long n, long seed, double scale) {
         launchGrid(fFillNoise, gridFor(n), 1, Pointer.to(out), Pointer.to(new long[]{n}), Pointer.to(new long[]{seed}),
                 Pointer.to(new double[]{scale}));
@@ -883,6 +935,10 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
     public boolean isFftSlotIndependent() { return fftIndependent; }
     /** Self-test: the single-slot plans give bitwise the batched plans' output. */
     public boolean isFftSingleEquivalent() { return fftEquivalent; }
+    /** Whether the D2Z plans left their input bitwise unchanged at construction (informational; see d2zInputTest). */
+    public boolean isFftD2ZInputKept() { return fftKeepsInput; }
+    /** The transform policy given to the constructor: FFT_AUTO, FFT_BATCHED or FFT_SLOTWISE. */
+    public int getFftPolicy() { return fftPolicy; }
     /** Bytes of the one cuFFT work area all plans share. */
     public long getFftWorkBytes() { return fftWorkBytes; }
 
@@ -890,8 +946,10 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
         final String mode = fftMode == FFT_SLOTWISE ? "slotwise" : fftMode == FFT_HYBRID ? "hybrid" : "batched";
         return mode + " (n " + n1 + " x " + n2 + ", maxBatch " + maxBatch + (fftTested ? ", self-test: batched plans "
                 + (fftIndependent ? "slot-independent" : "COUPLE slots") + ", single-slot plans "
-                + (fftEquivalent ? "bitwise equal" : "differ or unused") : ", not tested") + ", work area "
-                + fftWorkBytes + " B)";
+                + (fftEquivalent ? "bitwise equal" : "differ or unused") : ", not tested")
+                + (fftPolicy == FFT_AUTO ? "" : ", policy FORCED by the constructor")
+                + (fftKeepsInput ? ", D2Z input kept" : ", D2Z OVERWRITES its input (harmless: no step reads it)")
+                + ", work area " + fftWorkBytes + " B)";
     }
 
     /**
@@ -1100,12 +1158,22 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
                     Pointer.to(dScaleS), Pointer.to(new long[]{NG}));
         }
 
-        // the root (L1575-1638)
+        // the root (L1575-1638). Every kernel that reads the root grid Proot (root_stats, root_dot) runs BEFORE its
+        // D2Z: no step reads the input of a D2Z after the transform, so nothing relies on cuFFT leaving the input of
+        // an out-of-place R2C untouched (it is documented only for C2R that the input is overwritten; the self-test
+        // records what the running device does, describeTransforms). root_T needs only musub and E2. The kernels
+        // write disjoint fields of part (FHI / FLO / FBAND, RS / RE, POST), so the order does not change any value.
         final CUdeviceptr Proot = dBuf[rootBuffer];
         final Pointer pHasRoot = Pointer.to(dHasRoot), pPresRoot = Pointer.to(presOf(root));
         final Pointer iR0 = Pointer.to(new int[]{r0}), iR1 = Pointer.to(new int[]{r1}), iC0 = Pointer.to(new int[]{c0});
         launchGrid(fRootStats, nblk, nSl, Pointer.to(Proot), pPresRoot, pSlot, pSite, pHasRoot, pDead, Pointer.to(dNB),
                 iN1, iN2, pPart);
+        if (anyLam) {
+            launchGrid(fRootT, gridFor((long) M * n2), nSl, Pointer.to(dT), Pointer.to(dMU), Pointer.to(dE2), pPresRoot,
+                    pSlot, pSite, pHasRoot, pDead, pParam, iN2, Pointer.to(new int[]{M}));
+        }
+        launchGrid(fRootDot, nblk, nSl, Pointer.to(Proot), Pointer.to(dT), Pointer.to(dE1), pPresRoot, pSlot, pSite,
+                pHasRoot, pDead, pParam, iN1, iN2, Pointer.to(new int[]{M}), pPart);
         if (slotwiseFor(nSl)) {                         // every site of a chunk has a root message
             for (int s = 0; s < nSl; s++) {
                 d2zSlot(Proot, s, dX);
@@ -1117,12 +1185,6 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
         }
         launchGrid(fRootRes, nblk, nSl, Pointer.to(dX), pPresRoot, pSlot, pSite, pHasRoot, pDead, iN1, iN2h, iR0, iR1, iC0,
                 pPart);
-        if (anyLam) {
-            launchGrid(fRootT, gridFor((long) M * n2), nSl, Pointer.to(dT), Pointer.to(dMU), Pointer.to(dE2), pPresRoot,
-                    pSlot, pSite, pHasRoot, pDead, pParam, iN2, Pointer.to(new int[]{M}));
-        }
-        launchGrid(fRootDot, nblk, nSl, Pointer.to(Proot), Pointer.to(dT), Pointer.to(dE1), pPresRoot, pSlot, pSite,
-                pHasRoot, pDead, pParam, iN1, iN2, Pointer.to(new int[]{M}), pPart);
         launchGrid(fRootFinal, nc, 1, pSite, pSlot, pHasRoot, pDead, pPresRoot, pPart, iNblk, Pointer.to(dX),
                 Pointer.to(new long[]{N2}), Pointer.to(cOf(root)), Pointer.to(lsOf(root)), Pointer.to(dHH),
                 Pointer.to(new double[]{TWO_PI * TWO_PI}), Pointer.to(dGLeak), Pointer.to(dGRes), Pointer.to(dGStat),
