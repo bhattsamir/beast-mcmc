@@ -44,6 +44,13 @@ import static jcuda.driver.JCudaDriver.*;
  * ratio, rho_min (the worst product overlap) and NONPOSITIVE. The LEAK and RESOLUTION thresholds are applied here
  * ({@link #setTolerances}); the PRECISION shadow, refinement, verification and the torus fallback are not ported.
  *
+ * <p>Transforms: batched cuFFT D2Z / Z2D plans of batch maxBatch plus single-slot plans, sharing one work area.
+ * A construction self-test checks that the batched plans treat slots independently and that the single-slot plans
+ * give bitwise the same output (cuFFT couples slots at some sizes, e.g. a last dimension of 75 or 375); the engine
+ * then transforms batched, slot by slot, or either per transform ({@link #describeTransforms}). Before every batched
+ * transform the slots not read afterwards are zeroed. Values are therefore bitwise reproducible across calls,
+ * chunkings, call orders and maxBatch values.
+ *
  * <p>Not thread safe: one thread at a time (the CUDA context is made current on entry to every call).
  *
  * @author Samir Bhatt
@@ -154,13 +161,28 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
 
     // ---- device ---------------------------------------------------------------------------------------
     private final int deviceId;
-    private final CUcontext context;
-    private final CUmodule module;
+    private CUcontext context;                         // set once retained (released by close / a failed constructor)
+    private CUmodule module;                           // set once loaded
     private final CUfunction fGEval, fGpScale, fETable, fSiteInit, fMusub, fTipAxis, fTipBuild, fSlotPrep, fPropagate,
             fSiteLanding, fHermitianize, fCombine, fSiteProduct, fScaleParts, fRootStats, fRootRes, fRootT, fRootDot,
-            fRootFinal;
-    private final cufftHandle planD2Z, planZ2D;
+            fRootFinal, fZeroGrid, fZeroSpec, fFillNoise;
+    // cuFFT: batched plans (batch maxBatch) and single-slot plans (batch 1), any of them null when not used; all
+    // created without auto-allocation and sharing ONE work area (they run one after another on the null stream)
+    private cufftHandle planD2Z, planZ2D, plan1D2Z, plan1Z2D;
+    private final List<cufftHandle> plans = new ArrayList<cufftHandle>();
+    private CUdeviceptr dFftWork;
+    private long fftWorkBytes;
+    // one slot of grid values on an aligned allocation: cuFFT refuses a real grid that does not start on a 16-byte
+    // boundary (slot s > 0 of an odd n1 n2), so a single-slot transform of such a slot goes through this copy
+    private CUdeviceptr dAlignR;
+    /** FFT_BATCHED: every transform batched (padding, idle slots zeroed); FFT_SLOTWISE: every transform slot by slot
+     *  (cuFFT's batched plan couples slots at this n); FFT_HYBRID: both verified bitwise equal, chosen per transform. */
+    public static final int FFT_BATCHED = 0, FFT_HYBRID = 1, FFT_SLOTWISE = 2;
+    private int fftMode;
+    private boolean fftIndependent, fftEquivalent, fftTested;
     private final List<CUdeviceptr> allocations = new ArrayList<CUdeviceptr>();
+    private final byte[] codesHost;                    // [op][site] product code (0 skip, 1 first, 2 multiply)
+    private final int[] tipBoxHost;                    // [tip ordinal][site] box of the tip's observation, -1 = missing
     private final CUdeviceptr dOM1, dOM2, dGP, dE1, dE2, dHH, dNB, dGsub, dPhase, dTipBox, dPhaseOff, dCodes, dHasRoot,
             dTipLeak, dTipRes;
     private final CUdeviceptr[] dBuf;
@@ -190,7 +212,14 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
      * @param mu           landing mixture means (radians)
      * @param s            landing mixture covariances (rad^2)
      * @param deviceId     CUDA device ordinal
-     * @param maxBatch     slots per chunk and the fixed cuFFT batch (>= the most boxes of any site)
+     * @param maxBatch     slots per chunk and the batch of the batched cuFFT plans (>= the most boxes of any site);
+     *                     clamped to the engine's slot count. Every work buffer holds maxBatch slots, and a BATCHED
+     *                     transform costs maxBatch slots whatever the chunk holds; in FFT_HYBRID mode (the usual
+     *                     one, see setupTransforms) a transform that uses few slots runs slot by slot instead, so
+     *                     one-site calls do not pay for padding. A per-device engine of a multi-GPU split needs a
+     *                     maxBatch no larger than its own slot count (the clamp ensures it).
+     * @throws IllegalArgumentException on invalid inputs; any CUDA / cuFFT failure propagates after everything the
+     *                     constructor acquired (plans, buffers, module, primary context) has been released
      */
     public TorusBoxGpuEngine(int[][] children, int root, double[] branchLength, Box[][] boxes, int[][] tipBox,
                              double[][][] tipOffset, double[][] sigmaEps, double[] w, double[][] mu, double[][][] s,
@@ -291,10 +320,12 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
         this.n1 = gn1;
         this.n2 = gn2;
         this.n2h = n2 / 2 + 1;
-        this.maxBatch = maxBatch;
         if (maxBatch < mostBoxes) {
             throw new IllegalArgumentException("maxBatch (" + maxBatch + ") must hold the largest site (" + mostBoxes + " boxes)");
         }
+        // every work buffer and the batched cuFFT plans hold maxBatch slots, and a batched transform costs maxBatch
+        // slots whatever the chunk holds: never more than the engine has (mostBoxes <= ns, so this keeps the check)
+        this.maxBatch = Math.min(maxBatch, ns);
         final long NG = (long) n1 * n2, N2 = (long) n1 * n2h;
         this.nblk = (int) Math.max(1L, Math.min(128L, NG / (BLOCK * 4L)));
         this.fct = 1.0 / (double) NG;
@@ -428,157 +459,395 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
             if (has[root] && bxs.length == 0) throw new IllegalArgumentException("site " + site + " has observed tips but no box");
         }
 
-        // ---- device: context, module, plans
+        // ---- device: context, module, plans. Exception safe: if anything below throws, every plan, buffer, the
+        // module and the retained primary context acquired so far are released before the exception propagates
         this.deviceId = deviceId;
-        JCudaDriver.setExceptionsEnabled(true);
-        JCufft.setExceptionsEnabled(true);
-        cuInit(0);
-        final CUdevice device = new CUdevice();
-        cuDeviceGet(device, deviceId);
-        this.context = new CUcontext();
-        cuDevicePrimaryCtxRetain(context, device);
-        cuCtxSetCurrent(context);
-        this.module = new CUmodule();
-        cuModuleLoadData(module, loadPtx());
-        this.fGEval = function("g_eval");
-        this.fGpScale = function("gp_scale");
-        this.fETable = function("e_table");
-        this.fSiteInit = function("site_init");
-        this.fMusub = function("musub_build");
-        this.fTipAxis = function("tip_axis");
-        this.fTipBuild = function("tip_build");
-        this.fSlotPrep = function("slot_prep");
-        this.fPropagate = function("propagate");
-        this.fSiteLanding = function("site_landing");
-        this.fHermitianize = function("hermitianize");
-        this.fCombine = function("combine");
-        this.fSiteProduct = function("site_product");
-        this.fScaleParts = function("scale_parts");
-        this.fRootStats = function("root_stats");
-        this.fRootRes = function("root_res");
-        this.fRootT = function("root_T");
-        this.fRootDot = function("root_dot");
-        this.fRootFinal = function("root_final");
-        this.planD2Z = new cufftHandle();
-        JCufft.cufftPlanMany(planD2Z, 2, new int[]{n1, n2}, null, 1, (int) NG, null, 1, (int) N2, cufftType.CUFFT_D2Z, maxBatch);
-        this.planZ2D = new cufftHandle();
-        JCufft.cufftPlanMany(planZ2D, 2, new int[]{n1, n2}, null, 1, (int) N2, null, 1, (int) NG, cufftType.CUFFT_Z2D, maxBatch);
+        this.codesHost = codes;
+        this.tipBoxHost = tipBoxDev;
+        boolean built = false;
+        try {
+            JCudaDriver.setExceptionsEnabled(true);
+            JCufft.setExceptionsEnabled(true);
+            cuInit(0);
+            final CUdevice device = new CUdevice();
+            cuDeviceGet(device, deviceId);
+            final CUcontext ctx = new CUcontext();
+            cuDevicePrimaryCtxRetain(ctx, device);
+            this.context = ctx;
+            cuCtxSetCurrent(context);
+            final CUmodule mod = new CUmodule();
+            cuModuleLoadData(mod, loadPtx());
+            this.module = mod;
+            this.fGEval = function("g_eval");
+            this.fGpScale = function("gp_scale");
+            this.fETable = function("e_table");
+            this.fSiteInit = function("site_init");
+            this.fMusub = function("musub_build");
+            this.fTipAxis = function("tip_axis");
+            this.fTipBuild = function("tip_build");
+            this.fSlotPrep = function("slot_prep");
+            this.fPropagate = function("propagate");
+            this.fSiteLanding = function("site_landing");
+            this.fHermitianize = function("hermitianize");
+            this.fCombine = function("combine");
+            this.fSiteProduct = function("site_product");
+            this.fScaleParts = function("scale_parts");
+            this.fRootStats = function("root_stats");
+            this.fRootRes = function("root_res");
+            this.fRootT = function("root_T");
+            this.fRootDot = function("root_dot");
+            this.fRootFinal = function("root_final");
+            this.fZeroGrid = function("zero_idle_grid");
+            this.fZeroSpec = function("zero_idle_spec");
+            this.fFillNoise = function("fill_noise");
 
-        // ---- work buffers (maxBatch slots), zeroed so that padding slots hold finite values
-        final long B = maxBatch;
-        this.dX = zeros(B * N2 * 16L);
-        this.dR = zeros(B * NG * 8L);
-        this.dBuf = new CUdeviceptr[nBuffers];
-        for (int i = 0; i < nBuffers; i++) dBuf[i] = zeros(B * NG * 8L);
-        this.dT = zeros(B * M * (long) n2 * 16L);
-        this.dTipAx = zeros(B * (long) (n1 + n2h) * 16L);
-        this.dMU = zeros(B * (long) M * M * 16L);
-        this.dPart = zeros(B * nblk * NPART * 8L);
-        this.dC = zeros((long) nodeCount * B * 8L);
-        this.dLS = zeros((long) nodeCount * B * 8L);
-        this.dPres = zeros((long) nodeCount * B * 4L);
-        this.dPresTmp = zeros(B * 4L);
-        this.dOPres = zeros(B * 4L);
-        this.dZeros = zeros(B * 8L);
-        this.dCp = zeros(B * 8L);
-        this.dScaleS = zeros(B * 8L);
-        this.dX00 = zeros(B * 16L);
-        this.dX0 = zeros(B * 8L);
-        this.dLand = zeros(B * 8L);
-        this.dMode = zeros(B * 4L);
-        this.dSlotInfo = zeros(B * 4L * 4L);
-        this.dSiteInfo = zeros(B * 4L * 4L);
-        this.dSiteParam = zeros(B * 8L * 8L);
-        this.dGLeak = zeros(B * 8L);
-        this.dGRes = zeros(B * 8L);
-        this.dGRho = zeros(B * 8L);
-        this.dGStat = zeros(B * 4L);
-        this.dGDead = zeros(B * 4L);
-        this.dGNode = zeros(B * 4L);
-        this.dOutLogL = zeros(B * 8L);
+            // ---- work buffers (maxBatch slots), zeroed so that padding slots hold finite values
+            final long B = this.maxBatch;
+            this.dX = zeros(B * N2 * 16L);
+            this.dR = zeros(B * NG * 8L);
+            this.dBuf = new CUdeviceptr[nBuffers];
+            for (int i = 0; i < nBuffers; i++) dBuf[i] = zeros(B * NG * 8L);
+            this.dT = zeros(B * M * (long) n2 * 16L);
+            this.dTipAx = zeros(B * (long) (n1 + n2h) * 16L);
+            this.dMU = zeros(B * (long) M * M * 16L);
+            this.dPart = zeros(B * nblk * NPART * 8L);
+            this.dC = zeros((long) nodeCount * B * 8L);
+            this.dLS = zeros((long) nodeCount * B * 8L);
+            this.dPres = zeros((long) nodeCount * B * 4L);
+            this.dPresTmp = zeros(B * 4L);
+            this.dOPres = zeros(B * 4L);
+            this.dZeros = zeros(B * 8L);
+            this.dCp = zeros(B * 8L);
+            this.dScaleS = zeros(B * 8L);
+            this.dX00 = zeros(B * 16L);
+            this.dX0 = zeros(B * 8L);
+            this.dLand = zeros(B * 8L);
+            this.dMode = zeros(B * 4L);
+            this.dSlotInfo = zeros(B * 4L * 4L);
+            this.dSiteInfo = zeros(B * 4L * 4L);
+            this.dSiteParam = zeros(B * 8L * 8L);
+            this.dGLeak = zeros(B * 8L);
+            this.dGRes = zeros(B * 8L);
+            this.dGRho = zeros(B * 8L);
+            this.dGStat = zeros(B * 4L);
+            this.dGDead = zeros(B * 4L);
+            this.dGNode = zeros(B * 4L);
+            this.dOutLogL = zeros(B * 8L);
 
-        // ---- persistent tables
-        this.dOM1 = upload(om1All);
-        this.dOM2 = upload(om2All);
-        this.dHH = upload(hhAll);
-        this.dNB = upload(nbAll);
-        this.dTipLeak = upload(tipLeak);
-        this.dTipRes = upload(tipRes);
-        this.dCodes = uploadBytes(codes);
-        final byte[] hasRootB = new byte[nSites];
-        for (int site = 0; site < nSites; site++) hasRootB[site] = (byte) (siteHasRoot[site] ? 1 : 0);
-        this.dHasRoot = uploadBytes(hasRootB);
-        this.dTipBox = upload(tipBoxDev.length == 0 ? new int[1] : tipBoxDev);
-        this.dPhaseOff = upload(phaseOff.length == 0 ? new long[1] : phaseOff);
-        this.dGsub = upload(mix.gsub);
-        this.dGP = alloc((long) ns * N2 * 16L);
-        this.dE1 = alloc((long) ns * n1 * M * 16L);
-        this.dE2 = alloc((long) ns * n2 * M * 16L);
-        this.dPhase = alloc(Math.max(1L, phaseLen) * 8L);
+            // ---- cuFFT plans and their construction self-test (see setupTransforms)
+            setupTransforms();
 
-        // g_sup (L787-800): 1.01 x max(g on a 0.25 deg torus grid, g at the component means)
-        {
-            final int ng = 1440;
-            final double[] xg = new double[ng];
-            for (int i = 0; i < ng; i++) xg[i] = (double) i * (TWO_PI / 1440);
-            final CUdeviceptr tmp = alloc((long) ng * ng * 8L);
-            gEval(mix, xg, xg, tmp);
-            final double[] gv = new double[ng * ng];
-            cuMemcpyDtoH(Pointer.to(gv), tmp, 8L * gv.length);
-            double gmax = Double.NEGATIVE_INFINITY;
-            for (double v : gv) gmax = Math.max(gmax, v);
-            for (int k = 0; k < mix.K; k++) {
-                gEval(mix, new double[]{mu[k][0]}, new double[]{mu[k][1]}, tmp);
-                final double[] one = new double[1];
-                cuMemcpyDtoH(Pointer.to(one), tmp, 8L);
-                gmax = Math.max(gmax, one[0]);
+            // ---- persistent tables
+            this.dOM1 = upload(om1All);
+            this.dOM2 = upload(om2All);
+            this.dHH = upload(hhAll);
+            this.dNB = upload(nbAll);
+            this.dTipLeak = upload(tipLeak);
+            this.dTipRes = upload(tipRes);
+            this.dCodes = uploadBytes(codes);
+            final byte[] hasRootB = new byte[nSites];
+            for (int site = 0; site < nSites; site++) hasRootB[site] = (byte) (siteHasRoot[site] ? 1 : 0);
+            this.dHasRoot = uploadBytes(hasRootB);
+            this.dTipBox = upload(tipBoxDev.length == 0 ? new int[1] : tipBoxDev);
+            this.dPhaseOff = upload(phaseOff.length == 0 ? new long[1] : phaseOff);
+            this.dGsub = upload(mix.gsub);
+            this.dGP = alloc((long) ns * N2 * 16L);
+            this.dE1 = alloc((long) ns * n1 * M * 16L);
+            this.dE2 = alloc((long) ns * n2 * M * 16L);
+            this.dPhase = alloc(Math.max(1L, phaseLen) * 8L);
+
+            // g_sup (L787-800): 1.01 x max(g on a 0.25 deg torus grid, g at the component means)
+            {
+                final int ng = 1440;
+                final double[] xg = new double[ng];
+                for (int i = 0; i < ng; i++) xg[i] = (double) i * (TWO_PI / 1440);
+                final CUdeviceptr tmp = alloc((long) ng * ng * 8L);
+                gEval(mix, xg, xg, tmp);
+                final double[] gv = new double[ng * ng];
+                cuMemcpyDtoH(Pointer.to(gv), tmp, 8L * gv.length);
+                double gmax = Double.NEGATIVE_INFINITY;
+                for (double v : gv) gmax = Math.max(gmax, v);
+                for (int k = 0; k < mix.K; k++) {
+                    gEval(mix, new double[]{mu[k][0]}, new double[]{mu[k][1]}, tmp);
+                    final double[] one = new double[1];
+                    cuMemcpyDtoH(Pointer.to(one), tmp, 8L);
+                    gmax = Math.max(gmax, one[0]);
+                }
+                freeNow(tmp);
+                this.gsup = 1.01 * gmax;
             }
-            freeNow(tmp);
-            this.gsup = 1.01 * gmax;
+            // gam_b (L370-377): g on every box grid, rfft2, times wq h1 h2 / (n1 n2); groups of maxBatch slots
+            // through the engine's own D2Z (dR -> dX), batched or slot by slot as every other transform
+            final double[] wq = new double[n2h];
+            Arrays.fill(wq, 2.0);
+            wq[0] = 1.0;
+            if (n2 % 2 == 0) wq[n2h - 1] = 1.0;
+            for (int g0 = 0; g0 < ns; g0 += this.maxBatch) {
+                final int g1 = Math.min(ns, g0 + this.maxBatch);
+                for (int gsl = g0; gsl < g1; gsl++) {
+                    gEval(mix, x1All[gsl], x2All[gsl], (CUdeviceptr) dR.withByteOffset((gsl - g0) * NG * 8L));
+                }
+                if (slotwiseFor(g1 - g0)) {
+                    for (int k = 0; k < g1 - g0; k++) d2zSlot(dR, k, dX);
+                } else {
+                    if (g1 - g0 < this.maxBatch) {                 // padding slots: zero, not the previous group's g
+                        cuMemsetD8(dR.withByteOffset((g1 - g0) * NG * 8L), (byte) 0, (this.maxBatch - (g1 - g0)) * NG * 8L);
+                    }
+                    JCufft.cufftExecD2Z(planD2Z, dR, dX);
+                }
+                for (int gsl = g0; gsl < g1; gsl++) {
+                    final double hfac = hhAll[gsl] / (double) NG;
+                    final double[] colfac = new double[n2h];
+                    for (int j = 0; j < n2h; j++) colfac[j] = wq[j] * hfac;
+                    final CUdeviceptr dcf = upload(colfac);
+                    launchGrid(fGpScale, gridFor(N2), 1, Pointer.to((CUdeviceptr) dGP.withByteOffset(gsl * N2 * 16L)),
+                            Pointer.to((CUdeviceptr) dX.withByteOffset((gsl - g0) * N2 * 16L)), Pointer.to(dcf),
+                            Pointer.to(new int[]{n2h}), Pointer.to(new long[]{N2}));
+                    cuCtxSynchronize();
+                    freeNow(dcf);
+                }
+            }
+            // E1, E2 (L379-382): exp(-1j x m) on every box grid, |m_i| <= Mcut
+            for (int gsl = 0; gsl < ns; gsl++) {
+                eTable(x1All[gsl], (CUdeviceptr) dE1.withByteOffset((long) gsl * n1 * M * 16L));
+                eTable(x2All[gsl], (CUdeviceptr) dE2.withByteOffset((long) gsl * n2 * M * 16L));
+            }
+            // tip phase tables (L384-391): th = 2 pi frac(p d / L) per axis, reduced error-free (double-double)
+            for (int site = 0; site < nSites; site++) {
+                for (int v = 0; v < nodeCount; v++) {
+                    if (!isTip[v] || tipBox[site][v] < 0) continue;
+                    final Box bx = boxes[site][tipBox[site][v]];
+                    final double[] d = tipOffset[site][v];
+                    final double[] th = new double[n1 + n2h];
+                    for (int i = 0; i < n1; i++) th[i] = tipPhase(pf[i], d[0], bx.widthPhi);
+                    for (int j = 0; j < n2h; j++) th[n1 + j] = tipPhase(qf[j], d[1], bx.widthPsi);
+                    final long off = phaseOff[tipOrdinal[v] * nSites + site];
+                    cuMemcpyHtoD(dPhase.withByteOffset(off * 8L), Pointer.to(th), 8L * th.length);
+                }
+            }
+            // the transform buffers start every call from zero, not from the constructor's g and Gp
+            cuMemsetD8(dR, (byte) 0, B * NG * 8L);
+            cuMemsetD8(dX, (byte) 0, B * N2 * 16L);
+            cuCtxSynchronize();
+            built = true;
+        } finally {
+            if (!built) {
+                closed = true;
+                releaseAll();                                  // best effort; the original exception propagates
+            }
         }
-        // gam_b (L370-377): g on every box grid, rfft2, times wq h1 h2 / (n1 n2); batches of maxBatch slots through
-        // the engine's own D2Z plan (dR -> dX)
-        final double[] wq = new double[n2h];
-        Arrays.fill(wq, 2.0);
-        wq[0] = 1.0;
-        if (n2 % 2 == 0) wq[n2h - 1] = 1.0;
-        for (int g0 = 0; g0 < ns; g0 += maxBatch) {
-            final int g1 = Math.min(ns, g0 + maxBatch);
-            for (int gsl = g0; gsl < g1; gsl++) {
-                gEval(mix, x1All[gsl], x2All[gsl], (CUdeviceptr) dR.withByteOffset((gsl - g0) * NG * 8L));
+    }
+
+    // ---- cuFFT plans, the slot-independence self-test and the transform policy ------------------------------
+
+    /**
+     * Creates the cuFFT plans and decides how transforms run. cuFFT's batched D2Z / Z2D is not slot-independent at
+     * every size: at some n (seen at a last dimension of 75, 375 and 1125 with cuFFT 11.3 on an RTX A6000) a slot's
+     * transform picks up round-off proportional to the OTHER batch elements' magnitude, so a site's value would
+     * depend on its other boxes, on the other sites of its chunk and on stale padding. This is tested here, on this
+     * device and library, before any table is built:
+     *
+     * <ol>
+     *   <li>independence: probe slots 0, 1 and maxBatch - 1 hold a fixed field (its spectrum for the Z2D); the
+     *   batched D2Z and Z2D must give the probe slot bitwise the same output with every other slot zero and with
+     *   every other slot holding noise of size 1e6;</li>
+     *   <li>equivalence: the single-slot plans must give the probe slot bitwise the batched output.</li>
+     * </ol>
+     *
+     * Independent and equivalent: FFT_HYBRID, each transform runs batched or slot by slot, whichever is cheaper
+     * (the values are bitwise the same). Independent only: FFT_BATCHED. Not independent: FFT_SLOTWISE, every
+     * transform slot by slot (only the slots a step uses). The system property {@code torus.box.fft} = batched |
+     * slotwise forces a policy (batched refuses a coupled n). Before every BATCHED transform the slots whose content
+     * is not read afterwards (padding and idle slots) are zeroed, so its input depends on the current call alone.
+     */
+    private void setupTransforms() {
+        final String force = System.getProperty("torus.box.fft", "auto").trim().toLowerCase(java.util.Locale.ROOT);
+        if (!force.equals("auto") && !force.equals("batched") && !force.equals("slotwise")) {
+            throw new IllegalArgumentException("torus.box.fft must be auto, batched or slotwise, not " + force);
+        }
+        final boolean wantBatched = !force.equals("slotwise") && maxBatch > 1;
+        final boolean wantSingle = !force.equals("batched") || maxBatch == 1;
+        if (wantBatched) {
+            planD2Z = makePlan(cufftType.CUFFT_D2Z, maxBatch);
+            planZ2D = makePlan(cufftType.CUFFT_Z2D, maxBatch);
+        }
+        if (wantSingle) {
+            plan1D2Z = makePlan(cufftType.CUFFT_D2Z, 1);
+            plan1Z2D = makePlan(cufftType.CUFFT_Z2D, 1);
+        }
+        attachWorkArea();
+        if (maxBatch == 1) {                                   // one slot: the single plans ARE the batched ones
+            planD2Z = plan1D2Z;
+            planZ2D = plan1Z2D;
+            fftIndependent = fftEquivalent = true;
+            fftMode = FFT_BATCHED;
+            return;
+        }
+        if (force.equals("slotwise")) {
+            fftMode = FFT_SLOTWISE;
+            if (((long) n1 * n2) % 2 == 1) alignBuffer();
+            return;
+        }
+        final boolean[] t = fftSelfTest();
+        fftTested = true;
+        fftIndependent = t[0];
+        fftEquivalent = t[1];
+        if (!fftIndependent) {
+            if (force.equals("batched")) {
+                throw new IllegalStateException("torus.box.fft=batched, but cuFFT's batched " + n1 + " x " + n2
+                        + " transforms are not slot-independent on device " + deviceId);
+            }
+            fftMode = FFT_SLOTWISE;
+            destroyPlan(planD2Z);
+            destroyPlan(planZ2D);
+            planD2Z = planZ2D = null;
+        } else if (fftEquivalent && !force.equals("batched")) {
+            fftMode = FFT_HYBRID;
+        } else {
+            fftMode = FFT_BATCHED;
+            destroyPlan(plan1D2Z);
+            destroyPlan(plan1Z2D);
+            plan1D2Z = plan1Z2D = null;
+        }
+        attachWorkArea();                                      // shrink the shared work area to the plans kept
+        if (plan1D2Z != null && ((long) n1 * n2) % 2 == 1) alignBuffer();     // allocated here, not mid-call
+    }
+
+    private cufftHandle makePlan(int type, int batch) {
+        final cufftHandle h = new cufftHandle();
+        JCufft.cufftCreate(h);
+        plans.add(h);
+        JCufft.cufftSetAutoAllocation(h, 0);
+        final long[] ws = new long[1];
+        final int NG = n1 * n2, N2 = n1 * n2h;
+        if (type == cufftType.CUFFT_D2Z) {
+            JCufft.cufftMakePlanMany(h, 2, new int[]{n1, n2}, null, 1, NG, null, 1, N2, type, batch, ws);
+        } else {
+            JCufft.cufftMakePlanMany(h, 2, new int[]{n1, n2}, null, 1, N2, null, 1, NG, type, batch, ws);
+        }
+        planWork.put(h, ws[0]);
+        return h;
+    }
+
+    private final java.util.Map<cufftHandle, Long> planWork = new java.util.IdentityHashMap<cufftHandle, Long>();
+
+    /** One work area of the largest size any live plan needs, given to every live plan. */
+    private void attachWorkArea() {
+        long need = 8L;
+        for (cufftHandle h : plans) need = Math.max(need, planWork.get(h));
+        if (dFftWork == null || need != fftWorkBytes) {
+            if (dFftWork != null) freeNow(dFftWork);
+            dFftWork = null;
+            dFftWork = alloc(need);
+            fftWorkBytes = need;
+        }
+        for (cufftHandle h : plans) JCufft.cufftSetWorkArea(h, dFftWork);
+    }
+
+    private void destroyPlan(cufftHandle h) {
+        if (h == null || !plans.remove(h)) return;
+        planWork.remove(h);
+        JCufft.cufftDestroy(h);
+    }
+
+    /** {independent, equivalent}: see setupTransforms. Uses dR and dX and leaves them zero. */
+    private boolean[] fftSelfTest() {
+        final int B = maxBatch;
+        final long NG = (long) n1 * n2, N2 = (long) n1 * n2h;
+        final long seed = 0x7B0C5EEDL;
+        boolean indep = true, equiv = true;
+        final int[] probes = B > 2 ? new int[]{0, 1, B - 1} : new int[]{0, 1};
+        for (int s : probes) {
+            final CUdeviceptr rS = (CUdeviceptr) dR.withByteOffset(s * NG * 8L);
+            final CUdeviceptr xS = (CUdeviceptr) dX.withByteOffset(s * N2 * 16L);
+            // the probe field alone, every other slot zero
+            cuMemsetD8(dR, (byte) 0, B * NG * 8L);
+            fillNoise(rS, NG, seed, 1.0);
+            JCufft.cufftExecD2Z(planD2Z, dR, dX);
+            final double[] specA = fetch(xS, 2 * N2);
+            cuMemsetD8(dX, (byte) 0, B * N2 * 16L);
+            cuMemcpyHtoD(xS, Pointer.to(specA), 16L * N2);
+            JCufft.cufftExecZ2D(planZ2D, dX, dR);                 // (a C2R may overwrite its input)
+            final double[] gridA = fetch(rS, NG);
+            // the same field, every other slot holding noise 1e6 times larger
+            for (int o = 0; o < B; o++) {
+                fillNoise((CUdeviceptr) dR.withByteOffset(o * NG * 8L), NG, o == s ? seed : seed + 1 + o, o == s ? 1.0 : 1e6);
             }
             JCufft.cufftExecD2Z(planD2Z, dR, dX);
-            for (int gsl = g0; gsl < g1; gsl++) {
-                final double hfac = hhAll[gsl] / (double) NG;
-                final double[] colfac = new double[n2h];
-                for (int j = 0; j < n2h; j++) colfac[j] = wq[j] * hfac;
-                final CUdeviceptr dcf = upload(colfac);
-                launchGrid(fGpScale, gridFor(N2), 1, Pointer.to((CUdeviceptr) dGP.withByteOffset(gsl * N2 * 16L)),
-                        Pointer.to((CUdeviceptr) dX.withByteOffset((gsl - g0) * N2 * 16L)), Pointer.to(dcf),
-                        Pointer.to(new int[]{n2h}), Pointer.to(new long[]{N2}));
-                cuCtxSynchronize();
-                freeNow(dcf);
+            indep &= Arrays.equals(fetch(xS, 2 * N2), specA);    // Arrays.equals(double[]) compares bit patterns
+            cuMemcpyHtoD(xS, Pointer.to(specA), 16L * N2);       // the other slots keep the noise spectra
+            JCufft.cufftExecZ2D(planZ2D, dX, dR);
+            indep &= Arrays.equals(fetch(rS, NG), gridA);
+            // the single-slot plans on this slot
+            if (plan1D2Z != null) {
+                fillNoise(rS, NG, seed, 1.0);
+                d2zSlot(dR, s, dX);
+                equiv &= Arrays.equals(fetch(xS, 2 * N2), specA);
+                cuMemcpyHtoD(xS, Pointer.to(specA), 16L * N2);
+                z2dSlot(dX, s, dR);
+                equiv &= Arrays.equals(fetch(rS, NG), gridA);
+            } else {
+                equiv = false;
             }
         }
-        // E1, E2 (L379-382): exp(-1j x m) on every box grid, |m_i| <= Mcut
-        for (int gsl = 0; gsl < ns; gsl++) {
-            eTable(x1All[gsl], (CUdeviceptr) dE1.withByteOffset((long) gsl * n1 * M * 16L));
-            eTable(x2All[gsl], (CUdeviceptr) dE2.withByteOffset((long) gsl * n2 * M * 16L));
-        }
-        // tip phase tables (L384-391): th = 2 pi frac(p d / L) per axis, reduced error-free (double-double)
-        for (int site = 0; site < nSites; site++) {
-            for (int v = 0; v < nodeCount; v++) {
-                if (!isTip[v] || tipBox[site][v] < 0) continue;
-                final Box bx = boxes[site][tipBox[site][v]];
-                final double[] d = tipOffset[site][v];
-                final double[] th = new double[n1 + n2h];
-                for (int i = 0; i < n1; i++) th[i] = tipPhase(pf[i], d[0], bx.widthPhi);
-                for (int j = 0; j < n2h; j++) th[n1 + j] = tipPhase(qf[j], d[1], bx.widthPsi);
-                final long off = phaseOff[tipOrdinal[v] * nSites + site];
-                cuMemcpyHtoD(dPhase.withByteOffset(off * 8L), Pointer.to(th), 8L * th.length);
-            }
-        }
+        cuMemsetD8(dR, (byte) 0, B * NG * 8L);
+        cuMemsetD8(dX, (byte) 0, B * N2 * 16L);
         cuCtxSynchronize();
+        return new boolean[]{indep, equiv};
+    }
+
+    private void fillNoise(CUdeviceptr out, long n, long seed, double scale) {
+        launchGrid(fFillNoise, gridFor(n), 1, Pointer.to(out), Pointer.to(new long[]{n}), Pointer.to(new long[]{seed}),
+                Pointer.to(new double[]{scale}));
+    }
+
+    private double[] fetch(CUdeviceptr src, long len) {
+        final double[] a = new double[(int) len];
+        cuCtxSynchronize();
+        cuMemcpyDtoH(Pointer.to(a), src, 8L * len);
+        return a;
+    }
+
+    /**
+     * Whether a transform over k used slots runs slot by slot: always in FFT_SLOTWISE, never in FFT_BATCHED. In
+     * FFT_HYBRID (values bitwise identical either way) when it is cheaper. Measured on an RTX A6000 (623-node tree,
+     * 42 slots): slot by slot costs about 1.1 x a batched slot at n 1024 and 1.7 x at n 256 (launch-bound), while a
+     * batched transform always costs maxBatch slots. So: on grids of 2^18 points and more when 1.1 k < maxBatch,
+     * on smaller grids when 2 k <= maxBatch.
+     */
+    private boolean slotwiseFor(int k) {
+        if (fftMode == FFT_SLOTWISE) return true;
+        if (fftMode == FFT_BATCHED) return false;
+        return ((long) n1 * n2 >= (1L << 18)) ? 11L * k < 10L * maxBatch : 2 * k <= maxBatch;
+    }
+
+    /** Single-slot D2Z of slot s: grid values at real + s n1 n2 doubles into the half spectrum at spec + s n1 n2h. */
+    private void d2zSlot(CUdeviceptr real, int s, CUdeviceptr spec) {
+        final long NG = (long) n1 * n2, ro = s * NG * 8L;
+        final Pointer out = spec.withByteOffset(s * (long) n1 * n2h * 16L);
+        if ((ro & 15L) == 0) {
+            JCufft.cufftExecD2Z(plan1D2Z, real.withByteOffset(ro), out);
+        } else {
+            cuMemcpyDtoD(alignBuffer(), (CUdeviceptr) real.withByteOffset(ro), NG * 8L);
+            JCufft.cufftExecD2Z(plan1D2Z, dAlignR, out);
+        }
+    }
+
+    /** Single-slot Z2D of slot s (the inverse of d2zSlot; a C2R may overwrite its input). */
+    private void z2dSlot(CUdeviceptr spec, int s, CUdeviceptr real) {
+        final long NG = (long) n1 * n2, ro = s * NG * 8L;
+        final Pointer in = spec.withByteOffset(s * (long) n1 * n2h * 16L);
+        if ((ro & 15L) == 0) {
+            JCufft.cufftExecZ2D(plan1Z2D, in, real.withByteOffset(ro));
+        } else {
+            JCufft.cufftExecZ2D(plan1Z2D, in, alignBuffer());
+            cuMemcpyDtoD((CUdeviceptr) real.withByteOffset(ro), dAlignR, NG * 8L);
+        }
+    }
+
+    private CUdeviceptr alignBuffer() {
+        if (dAlignR == null) dAlignR = alloc((long) n1 * n2 * 8L);
+        return dAlignR;
     }
 
     // ---- public accessors -----------------------------------------------------------------------------------
@@ -606,6 +875,33 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
     public long getResolutionFlagCount() { return resFlags; }
     public long getNonpositiveCount() { return nonpositive; }
     public double getLastSeconds() { return lastSeconds; }
+    /** FFT_BATCHED, FFT_HYBRID or FFT_SLOTWISE: how this engine's transforms run (see setupTransforms). */
+    public int getFftMode() { return fftMode; }
+    /** Whether the construction self-test ran (maxBatch > 1 and no forced slotwise policy). */
+    public boolean isFftTested() { return fftTested; }
+    /** Self-test: the batched plans' output for a slot does not depend on the other slots (bitwise). */
+    public boolean isFftSlotIndependent() { return fftIndependent; }
+    /** Self-test: the single-slot plans give bitwise the batched plans' output. */
+    public boolean isFftSingleEquivalent() { return fftEquivalent; }
+    /** Bytes of the one cuFFT work area all plans share. */
+    public long getFftWorkBytes() { return fftWorkBytes; }
+
+    public String describeTransforms() {
+        final String mode = fftMode == FFT_SLOTWISE ? "slotwise" : fftMode == FFT_HYBRID ? "hybrid" : "batched";
+        return mode + " (n " + n1 + " x " + n2 + ", maxBatch " + maxBatch + (fftTested ? ", self-test: batched plans "
+                + (fftIndependent ? "slot-independent" : "COUPLE slots") + ", single-slot plans "
+                + (fftEquivalent ? "bitwise equal" : "differ or unused") : ", not tested") + ", work area "
+                + fftWorkBytes + " B)";
+    }
+
+    /**
+     * The one guard policy callers should apply: a value is usable only with status 0. LEAK, RESOLUTION and
+     * NONPOSITIVE must be treated alike, because where RESOLUTION is far above its tolerance (an under-resolved,
+     * aliased grid) the sign of the root integral or of a node product is decided by round-off, so whether such a
+     * state comes back NONPOSITIVE (NaN) or finite with LEAK / RESOLUTION differs between this engine and
+     * box_landing.py (seen at a RESOLUTION ratio of 8e11). Neither value is a likelihood there.
+     */
+    public static boolean usable(int status) { return status == STATUS_OK; }
 
     /**
      * Log-likelihoods of the listed sites, each at its own diffusion covariance and landing rate.
@@ -673,6 +969,8 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
                                double[] outLogL, int[] outStatus, double[] outLeak, double[] outRes,
                                double[] outRhoMin) {
         final int[] slotInfo = new int[4 * nSl], siteInfo = new int[4 * nc];
+        final int[] slotSite = new int[nSl], slotBox = new int[nSl];        // host copies for the transform policy
+        final boolean[] idle = new boolean[nSl];
         final double[] siteParam = new double[8 * nc];
         boolean anyLam = false;
         int sl = 0;
@@ -685,6 +983,8 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
                 slotInfo[4 * sl] = siteSlot0[site] + b;
                 slotInfo[4 * sl + 1] = j;
                 slotInfo[4 * sl + 2] = b;
+                slotSite[sl] = site;
+                slotBox[sl] = b;
                 sl++;
             }
             final double S00 = sym[3 * i], S01 = sym[3 * i + 1], S11 = sym[3 * i + 2];
@@ -733,7 +1033,23 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
                 cChild = dZeros;
                 lsChild = dZeros;
             } else {
-                JCufft.cufftExecD2Z(planD2Z, dBuf[opBufChild[o]], dX);
+                // a slot is idle for this D2Z when its site is skipped at this op (known here); slots without a part
+                // or of a dead site are known on the device only (zeroed there before a batched transform)
+                int used = 0;
+                for (int s = 0; s < nSl; s++) {
+                    idle[s] = codesHost[o * nSites + slotSite[s]] == 0;
+                    if (!idle[s]) used++;
+                }
+                final CUdeviceptr in = dBuf[opBufChild[o]];
+                if (slotwiseFor(used)) {
+                    for (int s = 0; s < nSl; s++) {
+                        if (!idle[s]) d2zSlot(in, s, dX);
+                    }
+                } else {
+                    launchGrid(fZeroGrid, nblk, maxBatch, Pointer.to(in), Pointer.to(presOf(v)), pSlot, pSite, pCode, pDead,
+                            Pointer.to(new int[]{nSl}), Pointer.to(new long[]{NG}));
+                    JCufft.cufftExecD2Z(planD2Z, in, dX);
+                }
                 presChild = presOf(v);
                 cChild = cOf(v);
                 lsChild = lsOf(v);
@@ -750,7 +1066,26 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
                     Pointer.to(dGRes));
             launchGrid(fHermitianize, (2 * (n1 / 2 + 1) + BLOCK - 1) / BLOCK, nSl, Pointer.to(dX), Pointer.to(dMode),
                     iN1, iN2, iN2h);
-            JCufft.cufftExecZ2D(planZ2D, dX, dR);
+            // the Z2D: a slot is idle when its site is skipped at this op or (a tip) the observation is in another
+            // box (known here), or its mode is 0 or 3 (known on the device only)
+            {
+                int used = 0;
+                final int tipOrd = isTip[v] ? tipOrdinal[v] : -1;
+                for (int s = 0; s < nSl; s++) {
+                    idle[s] = codesHost[o * nSites + slotSite[s]] == 0
+                            || (tipOrd >= 0 && tipBoxHost[tipOrd * nSites + slotSite[s]] != slotBox[s]);
+                    if (!idle[s]) used++;
+                }
+                if (slotwiseFor(used)) {
+                    for (int s = 0; s < nSl; s++) {
+                        if (!idle[s]) z2dSlot(dX, s, dR);
+                    }
+                } else {
+                    launchGrid(fZeroSpec, nblk, maxBatch, Pointer.to(dX), Pointer.to(dMode), Pointer.to(new int[]{nSl}),
+                            Pointer.to(new long[]{N2}));
+                    JCufft.cufftExecZ2D(planZ2D, dX, dR);
+                }
+            }
             final CUdeviceptr P = dBuf[opBufParent[o]];
             launchGrid(fCombine, nblk, nSl, Pointer.to(P), Pointer.to(dR), Pointer.to(dMode), Pointer.to(presOf(p)),
                     Pointer.to(dOPres), pSlot, pSite, pCode, pDead, Pointer.to(cOf(p)), Pointer.to(dCp), Pointer.to(dNB),
@@ -771,7 +1106,15 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
         final Pointer iR0 = Pointer.to(new int[]{r0}), iR1 = Pointer.to(new int[]{r1}), iC0 = Pointer.to(new int[]{c0});
         launchGrid(fRootStats, nblk, nSl, Pointer.to(Proot), pPresRoot, pSlot, pSite, pHasRoot, pDead, Pointer.to(dNB),
                 iN1, iN2, pPart);
-        JCufft.cufftExecD2Z(planD2Z, Proot, dX);
+        if (slotwiseFor(nSl)) {                         // every site of a chunk has a root message
+            for (int s = 0; s < nSl; s++) {
+                d2zSlot(Proot, s, dX);
+            }
+        } else {
+            launchGrid(fZeroGrid, nblk, maxBatch, Pointer.to(Proot), pPresRoot, pSlot, pSite, pHasRoot, pDead,
+                    Pointer.to(new int[]{nSl}), Pointer.to(new long[]{NG}));
+            JCufft.cufftExecD2Z(planD2Z, Proot, dX);
+        }
         launchGrid(fRootRes, nblk, nSl, Pointer.to(dX), pPresRoot, pSlot, pSite, pHasRoot, pDead, iN1, iN2h, iR0, iR1, iC0,
                 pPart);
         if (anyLam) {
@@ -1190,6 +1533,7 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
      * n1 x n2h), "e1" (n1 x M complex), "e2" (n2 x M complex), "om1" (n1), "om2" (n2h).
      */
     public double[] debugSlotTable(String name, int globalSlot) {
+        if (closed) throw new IllegalStateException("engine closed");
         cuCtxSetCurrent(context);
         final long N2 = (long) n1 * n2h;
         final CUdeviceptr src;
@@ -1285,18 +1629,66 @@ public final class TorusBoxGpuEngine implements AutoCloseable {
         }
     }
 
+    /**
+     * Releases every plan, buffer, the module and the retained primary context. Each step runs even when an earlier
+     * one fails (e.g. a sticky context error); the first failure is rethrown at the end.
+     */
     @Override
     public void close() {
         if (closed) return;
         closed = true;
-        cuCtxSetCurrent(context);
-        JCufft.cufftDestroy(planD2Z);
-        JCufft.cufftDestroy(planZ2D);
-        for (CUdeviceptr p : allocations) cuMemFree(p);
+        final RuntimeException first = releaseAll();
+        if (first != null) throw first;
+    }
+
+    /** Best-effort release of everything acquired so far (close and a failed constructor); returns the first failure. */
+    private RuntimeException releaseAll() {
+        RuntimeException first = null;
+        if (context != null) {
+            try {
+                cuCtxSetCurrent(context);
+            } catch (RuntimeException e) {
+                first = e;
+            }
+        }
+        for (cufftHandle h : new ArrayList<cufftHandle>(plans)) {
+            try {
+                JCufft.cufftDestroy(h);
+            } catch (RuntimeException e) {
+                if (first == null) first = e;
+            }
+        }
+        plans.clear();
+        planWork.clear();
+        planD2Z = planZ2D = plan1D2Z = plan1Z2D = null;
+        for (CUdeviceptr p : allocations) {
+            try {
+                cuMemFree(p);
+            } catch (RuntimeException e) {
+                if (first == null) first = e;
+            }
+        }
         allocations.clear();
-        cuModuleUnload(module);
-        final CUdevice device = new CUdevice();
-        cuDeviceGet(device, deviceId);
-        cuDevicePrimaryCtxRelease(device);
+        dFftWork = null;
+        dAlignR = null;
+        if (module != null) {
+            try {
+                cuModuleUnload(module);
+            } catch (RuntimeException e) {
+                if (first == null) first = e;
+            }
+            module = null;
+        }
+        if (context != null) {
+            try {
+                final CUdevice device = new CUdevice();
+                cuDeviceGet(device, deviceId);
+                cuDevicePrimaryCtxRelease(device);
+            } catch (RuntimeException e) {
+                if (first == null) first = e;
+            }
+            context = null;
+        }
+        return first;
     }
 }

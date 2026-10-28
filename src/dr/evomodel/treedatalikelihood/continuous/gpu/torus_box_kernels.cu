@@ -877,3 +877,58 @@ extern "C" __global__ void root_final(const int* siteInfo, const int* slotInfo, 
         outLogL[j] = log(L) + LSroot[j];
     }
 }
+
+// ---- transform hygiene and the construction self-test ------------------------------------------------------
+//
+// cuFFT's batched D2Z / Z2D is not slot-independent at every size: at some n (seen at a last dimension of 75, 375
+// and 1125 with cuFFT 11.3) the transform of one batch element picks up round-off proportional to the OTHER
+// elements' magnitude. TorusBoxGpuEngine therefore tests its plans at construction (fill_noise below) and
+// transforms slot by slot where they couple. On top of that, every slot whose content is not read after a batched
+// transform (padding slots at index >= nSlots, and chunk slots that carry no part at this step) is set to zero
+// before the transform, so that the input of every batched transform is a function of the current call alone and
+// never of stale data from an earlier op, chunk, call or the constructor.
+
+// grid values, the input of a D2Z: a slot is idle if it is padding, its site is skipped at this step (flag 0: the
+// op's product code, or hasRoot at the root), its site is dead, or it holds no part (pres 0)
+extern "C" __global__ void zero_idle_grid(double* P, const int* pres, const int* slotInfo, const int* siteInfo,
+                                          const unsigned char* flag, const int* gDead, int nSlots, long long NG) {
+    const int slot = blockIdx.y;
+    if (slot < nSlots) {
+        const int site = slotInfo[4 * slot + 1];
+        const int gs = siteInfo[4 * site];
+        if (flag[gs] != 0 && !gDead[site] && pres[slot]) return;
+    }
+    double* p = P + (long long) slot * NG;
+    for (long long g = (long long) blockIdx.x * blockDim.x + threadIdx.x; g < NG; g += (long long) gridDim.x * blockDim.x) {
+        p[g] = 0.0;
+    }
+}
+
+// half spectra, the input of a Z2D: a slot is idle if it is padding or its mode is neither 1 nor 2 (combine reads
+// the transformed grid of modes 1 and 2 only)
+extern "C" __global__ void zero_idle_spec(double2* X, const int* sMode, int nSlots, long long N2) {
+    const int slot = blockIdx.y;
+    if (slot < nSlots) {
+        const int m = sMode[slot];
+        if (m == 1 || m == 2) return;
+    }
+    double2* x = X + (long long) slot * N2;
+    double2 z;
+    z.x = 0.0;
+    z.y = 0.0;
+    for (long long idx = (long long) blockIdx.x * blockDim.x + threadIdx.x; idx < N2; idx += (long long) gridDim.x * blockDim.x) {
+        x[idx] = z;
+    }
+}
+
+// The self-test's fields: out[i] = scale * u_i, u_i uniform in [-1, 1) from splitmix64(seed + i * golden gamma),
+// a fixed function of (seed, i), so every run and every device builds the same field.
+extern "C" __global__ void fill_noise(double* out, long long n, unsigned long long seed, double scale) {
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long) gridDim.x * blockDim.x) {
+        unsigned long long z = seed + (unsigned long long) i * 0x9E3779B97F4A7C15ULL;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        z = z ^ (z >> 31);
+        out[i] = scale * (((double) (z >> 11)) * (2.0 / 9007199254740992.0) - 1.0);
+    }
+}
